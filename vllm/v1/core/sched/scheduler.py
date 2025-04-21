@@ -456,6 +456,16 @@ class Scheduler(SchedulerInterface):
                 resumed_from_preemption=False,
             ) for req in scheduled_running_reqs
         ]
+        print(f"Scheduled {len(scheduled_new_reqs)} new requests, "
+              f"{len(scheduled_resumed_reqs)} resumed requests, "
+              f"{len(scheduled_running_reqs)} running requests, "
+              f"{len(preempted_reqs)} preempted requests, "
+              f"and {len(skipped_waiting_requests)} skipped requests. "
+              f"Total scheduled tokens: {total_num_scheduled_tokens}. "
+              f"Total encoder budget: {encoder_budget}. "
+              f"Total encoder cache size: {self.encoder_cache_manager.cache_size}."
+        )
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=resumed_reqs_data + running_reqs_data,
