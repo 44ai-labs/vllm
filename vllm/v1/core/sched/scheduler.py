@@ -462,8 +462,8 @@ class Scheduler(SchedulerInterface):
               f"{len(preempted_reqs)} preempted requests, "
               f"and {len(skipped_waiting_requests)} skipped requests. "
               f"Total scheduled tokens: {total_num_scheduled_tokens}. "
-              f"Total encoder budget: {encoder_budget}. "
-              f"Total encoder cache size: {self.encoder_cache_manager.cache_size}."
+              f"Total budget: {self.max_num_scheduled_tokens}. \n"
+              f"Tokens per request: {num_scheduled_tokens} " # dict
         )
 
         scheduler_output = SchedulerOutput(
