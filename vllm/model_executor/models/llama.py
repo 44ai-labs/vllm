@@ -247,7 +247,6 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        print("QKV shape:", qkv.shape, q.shape, k.shape, v.shape, self.q_size, self.kv_size)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
@@ -403,45 +402,27 @@ class LlamaModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        # they come all together here, [50] inputs
-        batch_size = hidden_states.shape[0]
-        # calculate batch_groups by id
-        # we have to check which batches are in the same group
-        batch_groups: dict[str, list[int]] = {}
-        for i in range(batch_size):
-            hash_of_input = get_tensor_hash(hidden_states[i], N=8)
-            if hash_of_input not in batch_groups:
-                batch_groups[hash_of_input] = [i]
-            else:
-                batch_groups[hash_of_input].append(i)
-        
-        print("Batch groups:", batch_groups)
-        print("Inside forward", input_ids.shape if input_ids is not None else None, positions.shape, hidden_states.shape, residual.shape if residual is not None else None)
-
-        # Filter out groups with only one item, as divergence requires >= 2 identical inputs
-        batch_groups_to_check = {h: idx_list for h, idx_list in batch_groups.items() if len(idx_list) > 1}
-        if batch_groups_to_check:
-             print(f"Found {len(batch_groups_to_check)} initial groups with identical inputs to check for divergence:")
-             for h, idx_list in batch_groups_to_check.items():
-                  print(f"  - Initial Hash {h}: Indices {idx_list}")
-        else:
-             print("No groups with initially identical inputs found (or only single-item groups). Skipping divergence check.")
-
+        batch_groups_to_check = None
+        batch_groups = None
         for i, layer in enumerate(self.layers[self.start_layer:self.end_layer]):
             layer_index = self.start_layer + i
 
-            # Store input tensors for comparison *if* we are checking on this rank
-            input_hidden_states_for_check = None
-            input_residual_for_check = None
-            if batch_groups is not None: # Check if grouping was performed (i.e., on rank 0)
-                # Clone inputs *before* the layer modifies them, only if needed for a check later
-                # This adds overhead, consider if checking output hashes directly is sufficient
-                # input_hidden_states_for_check = hidden_states.clone()
-                # if residual is not None:
-                #    input_residual_for_check = residual.clone()
-                pass # Decided to check output hashes directly, no need to clone input
-            # Execute the layer forward pass
             hidden_states, residual = layer(positions, hidden_states, residual)
+
+            BATCH_GROUP_CHECK = False
+            if BATCH_GROUP_CHECK:
+                print("After layer", layer_index, hidden_states.shape, residual.shape if residual is not None else None)
+                # if i == 1:
+                batch_groups = {}
+                for j in range(hidden_states.shape[0]):
+                    hash_of_input = get_tensor_hash(hidden_states[j], N=8)
+                    if hash_of_input not in batch_groups:
+                        batch_groups[hash_of_input] = [j]
+                    else:
+                        batch_groups[hash_of_input].append(j)
+                # Filter out groups with only one item, as divergence requires >= 2 identical inputs
+                batch_groups_to_check = {h: idx_list for h, idx_list in batch_groups.items() if len(idx_list) > 1}
+                print(f"Batch groups after layer {i}:", batch_groups)
 
             # --- Check for Divergence Within Initial Batch Groups (only on rank 0) ---
             CHECK_DIVERGENCE = False # Set to False to skip divergence check
@@ -508,16 +489,7 @@ class LlamaModel(nn.Module):
         # Apply final layer norm
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
-        # for layer in self.layers[self.start_layer:self.end_layer]:
-        #     hidden_states, residual = layer(positions, hidden_states, residual)
-        # if not get_pp_group().is_last_rank:
-        #     return IntermediateTensors({
-        #         "hidden_states": hidden_states,
-        #         "residual": residual
-        #     })
-        # print("After all layers", hidden_states.shape, residual.shape if residual is not None else None)
-        # hidden_states, _ = self.norm(hidden_states, residual)
-        # return hidden_states
+
 
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> Set[str]:
@@ -689,7 +661,6 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        # print(f"Forward pass with input_ids: {input_ids}, {positions}, {intermediate_tensors.tensors.keys() if intermediate_tensors else None}, {inputs_embeds.shape if inputs_embeds is not None else None}")
         model_output = self.model(input_ids, positions, intermediate_tensors,
                                   inputs_embeds)
         return model_output
