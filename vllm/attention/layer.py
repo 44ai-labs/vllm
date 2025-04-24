@@ -486,8 +486,8 @@ def unified_attention_with_output(
 
     # If there's no metadata, just forward everything
     if md_orig is None:
-        print("simple attention", layer_name, query.shape, key.shape,
-              value.shape, output.shape, kv_cache.shape)
+        # print("simple attention", layer_name, query.shape, key.shape,
+        #       value.shape, output.shape, kv_cache.shape)
         layer.impl.forward(layer, query, key, value, kv_cache, None, output=output)
         maybe_save_kv_layer_to_connector(layer_name, kv_cache)
         return
