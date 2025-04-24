@@ -50,6 +50,48 @@ from .utils import (AutoWeightsLoader, extract_layer_index,
 
 logger = init_logger(__name__)
 
+import hashlib
+
+def get_tensor_hash(tensor: Optional[torch.Tensor], N: int = 8) -> str:
+    """
+    Computes a partial SHA256 hash of a tensor's byte representation.
+
+    Args:
+        tensor: The tensor to hash. Can be None.
+        N: The number of characters of the hex digest to return.
+
+    Returns:
+        A string representing the partial hash or 'None'.
+    """
+    if tensor is None:
+        return "None"
+    try:
+        # Detach, move to CPU, convert to numpy, get bytes
+        # Using float32 for potentially more consistent byte representation across types? Or keep original?
+        # Let's try keeping original first, requires numpy >= 1.19 for bfloat16 if used
+        tensor_cpu = tensor.detach().cpu()
+        # Cast to float32 BEFORE converting to numpy to handle bfloat16
+        # This ensures compatibility with .tobytes()
+        if tensor_cpu.dtype == torch.bfloat16:
+            tensor_for_hashing = tensor_cpu.to(dtype=torch.float32)
+        else:
+            # Keep other types as they are (assuming they are supported by numpy/tobytes)
+            # Or potentially cast all float types to float32 for consistency:
+            # tensor_for_hashing = tensor_cpu.to(dtype=torch.float32)
+            tensor_for_hashing = tensor_cpu # Keep original if not bfloat16 for now
+
+        # Convert the potentially casted tensor to numpy bytes
+        tensor_bytes = tensor_for_hashing.numpy().tobytes()
+        hasher = hashlib.sha256()
+        hasher.update(tensor_bytes)
+        # Return the first N characters of the hex digest
+        return hasher.hexdigest()[:N]
+    except Exception as e:
+        # Fallback if hashing fails (e.g., unsupported dtype for tobytes)
+        shape_str = str(tensor.shape).replace(" ", "").replace("(", "").replace(")", "").replace(",", "_")
+        print(f"Warning: Could not hash tensor {shape_str}, {tensor.dtype}. Error: {e}")
+        # Use basic info like shape and dtype as fallback identifier
+        return f"shape{shape_str}_dtype{str(tensor.dtype).split('.')[-1]}"
 
 class Gemma3MLP(nn.Module):
 
@@ -84,8 +126,11 @@ class Gemma3MLP(nn.Module):
         self.act_fn = GeluAndMul(approximate="tanh")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # print(f"Hash before MLP: {get_tensor_hash(x[:32 if x.shape[0] >= 32 else 1])}")
         gate_up, _ = self.gate_up_proj(x)
+        # print(f"Hash after gate_up_proj: {get_tensor_hash(gate_up[:32 if x.shape[0] >= 32 else 1])}")
         x = self.act_fn(gate_up)
+        # print(f"Hash after activation: {get_tensor_hash(x[:32 if x.shape[0] >= 32 else 1])}")
         x, _ = self.down_proj(x)
         return x
 
@@ -185,6 +230,7 @@ class Gemma3Attention(nn.Module):
         hidden_states: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        # print(f"Hash before qkv_proj: {get_tensor_hash(hidden_states[:32 if hidden_states.shape[0] >= 32 else 1])}")
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
@@ -195,13 +241,16 @@ class Gemma3Attention(nn.Module):
         k = self.k_norm(k)
         k = k.flatten(-2, -1)
 
+        # print(f"Hash after qkv_proj: {get_tensor_hash(qkv[:32 if hidden_states.shape[0] >= 32 else 1])}")
         q, k = self.rotary_emb(positions, q, k)
+        print(f"Hash after rotary embedding: {get_tensor_hash(q[:32 if hidden_states.shape[0] >= 32 else 1])}, {get_tensor_hash(k[:32 if hidden_states.shape[0] >= 32 else 1])}")
         attn_output = self.attn(q, k, v)
 
         if not kwargs.get("has_images", False):
             # Fast path for text-only inputs. The performance for the text-only
             # inputs are not affected by the naive attention below.
             output, _ = self.o_proj(attn_output)
+            print(f"Hash after attention: {get_tensor_hash(output[:32 if hidden_states.shape[0] >= 32 else 1])}")
             return output
 
         # NOTE(woosuk): Gemma3 uses bidirectional attention between image tokens
@@ -326,17 +375,23 @@ class Gemma3DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
+        # print(f"Hash before attention: {get_tensor_hash(hidden_states[:32 if hidden_states.shape[0] >= 32 else 1])}")
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             **kwargs,
         )
+        # print(f"Hash after attention: {get_tensor_hash(hidden_states[:32 if hidden_states.shape[0] >= 32 else 1])}")
         hidden_states = self.post_attention_layernorm(hidden_states)
 
+        # print(f"Hash after post attention layernorm: {get_tensor_hash(hidden_states[:32 if hidden_states.shape[0] >= 32 else 1])}")
         hidden_states, residual = self.pre_feedforward_layernorm(
             hidden_states, residual)
+        # print(f"Hash after pre feedforward layernorm: {get_tensor_hash(hidden_states[:32 if hidden_states.shape[0] >= 32 else 1])}")
         hidden_states = self.mlp(hidden_states)
+        # print(f"Hash after MLP: {get_tensor_hash(hidden_states[:32 if hidden_states.shape[0] >= 32 else 1])}")
         hidden_states = self.post_feedforward_layernorm(hidden_states)
+        # print(f"Hash after post feedforward layernorm: {get_tensor_hash(hidden_states[:32 if hidden_states.shape[0] >= 32 else 1])}")
         return hidden_states, residual
 
 
@@ -491,6 +546,7 @@ class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self.quant_config = quant_config
         self.model = Gemma3Model(vllm_config=vllm_config,
                                  prefix=maybe_prefix(prefix, "model"))
+        # print("Gemma3 model loaded", self.model)
         self.logits_processor = LogitsProcessor(
             config.vocab_size, soft_cap=config.final_logit_softcapping)
         self.sampler = get_sampler()
