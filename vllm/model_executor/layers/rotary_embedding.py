@@ -159,6 +159,9 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Not needed as kernel is elementwise
+        # if torch.are_deterministic_algorithms_enabled():
+        #     return self.forward_native(positions, query, key, offsets)
         from vllm import _custom_ops as ops
 
         # __setattr__ in nn.Module (called by `self.cos_sin_cache = ...`)

@@ -76,6 +76,10 @@ class SiluAndMul(CustomOp):
         return F.silu(x[..., :d]) * x[..., d:]
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        # TODO(jannis): check if needed with llama model
+        # if torch.are_deterministic_algorithms_enabled():
+        #     return self.forward_native(x)
+        #   # Otherwise use the fused CUDA kernel for speed
         d = x.shape[-1] // 2
         output_shape = (x.shape[:-1] + (d, ))
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
