@@ -243,14 +243,14 @@ class Gemma3Attention(nn.Module):
 
         # print(f"Hash after qkv_proj: {get_tensor_hash(qkv[:32 if hidden_states.shape[0] >= 32 else 1])}")
         q, k = self.rotary_emb(positions, q, k)
-        print(f"Hash after rotary embedding: {get_tensor_hash(q[:32 if hidden_states.shape[0] >= 32 else 1])}, {get_tensor_hash(k[:32 if hidden_states.shape[0] >= 32 else 1])}")
+        # print(f"Hash after rotary embedding: {get_tensor_hash(q[:32 if hidden_states.shape[0] >= 32 else 1])}, {get_tensor_hash(k[:32 if hidden_states.shape[0] >= 32 else 1])}")
         attn_output = self.attn(q, k, v)
 
         if not kwargs.get("has_images", False):
             # Fast path for text-only inputs. The performance for the text-only
             # inputs are not affected by the naive attention below.
             output, _ = self.o_proj(attn_output)
-            print(f"Hash after attention: {get_tensor_hash(output[:32 if hidden_states.shape[0] >= 32 else 1])}")
+            # print(f"Hash after attention: {get_tensor_hash(output[:32 if hidden_states.shape[0] >= 32 else 1])}")
             return output
 
         # NOTE(woosuk): Gemma3 uses bidirectional attention between image tokens
