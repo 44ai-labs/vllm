@@ -26,6 +26,8 @@ from vllm.model_executor.parameter import (BasevLLMParameter,
                                            RowvLLMParameter)
 # yapf: enable
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.forward_context import ForwardContext, get_forward_context
+
 
 logger = init_logger(__name__)
 
@@ -188,7 +190,33 @@ class UnquantizedLinearMethod(LinearMethodBase):
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
 
-        return F.linear(x, layer.weight, bias)
+        # print("foward linear", layer.weight.shape, x.shape)
+        # return F.linear(x, layer.weight, bias)
+        if torch.are_deterministic_algorithms_enabled():
+            try:
+                attn_metadata = get_forward_context().attn_metadata
+                if attn_metadata is not None:
+                    qsl = attn_metadata.query_start_loc
+                    num_slices = qsl.numel() - 1
+                    if num_slices > 1:
+                        assert x.ndim == 2, (
+                            f"Expected x to be 2D, got {x.ndim}D. "
+                        )
+                        for i in range(num_slices):
+                            # print(f"run slice {i}")
+                            start = qsl[i].item()
+                            end = qsl[i + 1].item()
+                            x_slice = x[start:end, :]
+                            x_slice = F.linear(x_slice, layer.weight, bias)
+                            if i == 0:
+                                x_out = x_slice
+                            else:
+                                x_out = torch.cat((x_out, x_slice), dim=0)
+                        return x_out
+            except Exception as e:
+                print("forward context not found", str(e))
+
+            return F.linear(x, layer.weight, bias)
 
 
 class LinearBase(torch.nn.Module):
@@ -395,6 +423,7 @@ class ColumnParallelLinear(LinearBase):
             output_sizes = [output_size]
 
         assert self.quant_method is not None
+        # TODO(jannis): we have to do this for other quant methods still
         self.quant_method.create_weights(
             layer=self,
             input_size_per_partition=self.input_size_per_partition,
@@ -473,6 +502,10 @@ class ColumnParallelLinear(LinearBase):
         assert self.quant_method is not None
         output_parallel = self.quant_method.apply(self, input_, bias)
         if self.gather_output:
+            if torch.are_deterministic_algorithms_enabled():
+                raise RuntimeError(
+                    "Gather output is not supported when deterministic algorithms are enabled."
+                )
             # All-gather across the partitions.
             output = tensor_model_parallel_all_gather(output_parallel)
         else:
@@ -1245,6 +1278,10 @@ class RowParallelLinear(LinearBase):
         if self.input_is_parallel:
             input_parallel = input_
         else:
+            if torch.are_deterministic_algorithms_enabled():
+                raise RuntimeError(
+                    "Deterministic algorithms are enabled. "
+                    "Please disable them to use this layer.")
             tp_rank = get_tensor_model_parallel_rank()
             splitted_input = split_tensor_along_last_dim(
                 input_, num_partitions=self.tp_size)
@@ -1259,6 +1296,10 @@ class RowParallelLinear(LinearBase):
                                                   input_parallel,
                                                   bias=bias_)
         if self.reduce_results and self.tp_size > 1:
+            if torch.are_deterministic_algorithms_enabled():
+                raise RuntimeError(
+                    "Deterministic algorithms are enabled. "
+                    "Please disable them to use this layer.")
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
