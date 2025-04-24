@@ -501,8 +501,8 @@ def unified_attention_with_output(
         # print("sizes", query.shape, key.shape, value.shape, output.shape,)
         layer.impl.forward(layer, query, key, value, kv_cache, md_orig, output=output)
         # hashed comparison
-        hash_out = get_tensor_hash(output)
-        print(f"Output hash {layer_name}", hash_out)
+        # hash_out = get_tensor_hash(output)
+        # print(f"Output hash {layer_name}", hash_out)
         maybe_save_kv_layer_to_connector(layer_name, kv_cache)
         return
 
@@ -622,7 +622,7 @@ def unified_attention_with_output(
         #   - Correct slot_mapping for q_i
         # GQA is handled implicitly by the kernel based on head dims of q_i, k_i, v_i.
 
-        print(f"Slice {i}: q={q_i.shape}, k={k_i.shape}, v={v_i.shape}, out={out_i.shape}")
+        # print(f"Slice {i}: q={q_i.shape}, k={k_i.shape}, v={v_i.shape}, out={out_i.shape}")
         # print(f"Metadata: max_q={md.max_query_len}, cu_q={md.query_start_loc}, "
         #       f"max_k={md.max_seq_len}, seq_lens_k={md.seq_lens}, "
         #       f"block_table_shape={md.block_table.shape if md.block_table is not None else None}")
@@ -630,8 +630,8 @@ def unified_attention_with_output(
         layer.impl.forward(layer, q_i, k_i, v_i, kv_cache, md, output=out_i)
 
         # hashed comparison
-        hash_out = get_tensor_hash(out_i)
-        print(f"Output hash {layer_name}", hash_out)
+        # hash_out = get_tensor_hash(out_i)
+        # print(f"Output hash {layer_name}", hash_out)
 
 
 
