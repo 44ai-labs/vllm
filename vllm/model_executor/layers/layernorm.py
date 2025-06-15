@@ -135,7 +135,9 @@ class RMSNorm(CustomOp):
 
             x_var = x[:, :, :self.variance_size_override]
 
-        variance = x_var.pow(2).mean(dim=-1, keepdim=True)
+        # TODO(jannis): move variance to CPU for repro
+        # variance = x_var.pow(2).mean(dim=-1, keepdim=True)
+        variance = x.detach().cpu().pow(2).mean(dim=-1, keepdim=True).to(x.device)
 
         x = x * torch.rsqrt(variance + self.variance_epsilon)
         x = x.to(orig_dtype)
@@ -151,6 +153,11 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        
+        # This ensures bit‐for‐bit repeatability even with different batch shapes.
+        if torch.are_deterministic_algorithms_enabled():
+            return self.forward_native(x, residual)
+
         if self.variance_size_override is not None:
             return self.forward_native(x, residual)
 
@@ -244,7 +251,15 @@ class GemmaRMSNorm(CustomOp):
             residual = x
 
         x = x.float()
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        # variance = x.pow(2).mean(dim=-1, keepdim=True)
+        # Go to CPU for now
+        # TODO(jannis): move this to GPU
+        # On GPU we either need to split it into the blocks with attention_metadata
+        # variance = x.detach().cpu().pow(2).mean(dim=-1, keepdim=True).to(x.device)
+        # new try as sum is a different kernel
+        sum_sq = x.pow(2).sum(dim=-1, keepdim=True)
+        variance = sum_sq / x.shape[-1]
+
         x = x * torch.rsqrt(variance + variance_epsilon)
         # Llama does x.to(float16) * w whilst Gemma is (x * w).to(float16)
         # See https://github.com/huggingface/transformers/pull/29402
@@ -266,6 +281,11 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if torch.are_deterministic_algorithms_enabled():
+            # The static native impl is fully deterministic across any batch shape.
+            return self.forward_static(self.weight.data,
+                                       self.variance_epsilon,
+                                       x, residual)
         if torch.compiler.is_compiling():
             return self.forward_native(x, residual)
 

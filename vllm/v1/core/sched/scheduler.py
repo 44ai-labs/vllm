@@ -176,14 +176,42 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
-            num_new_tokens = (request.num_tokens_with_spec -
-                              request.num_computed_tokens)
+            # num_new_tokens = (request.num_tokens_with_spec -
+            #                   request.num_computed_tokens)
+            # if (0 < self.scheduler_config.long_prefill_token_threshold <
+            #         num_new_tokens):
+            #     num_new_tokens = (
+            #         self.scheduler_config.long_prefill_token_threshold)
+            # num_new_tokens = min(num_new_tokens, token_budget)
+            # print("NUM_NEW_TOKENS: ", num_new_tokens, request.request_id)
+            # assert num_new_tokens > 0
+
+            # 1. Calculate Potential Tokens needed
+            potential_num_new_tokens = (request.num_tokens_with_spec -
+                                        request.num_computed_tokens)
             if (0 < self.scheduler_config.long_prefill_token_threshold <
-                    num_new_tokens):
-                num_new_tokens = (
+                    potential_num_new_tokens):
+                potential_num_new_tokens = (
                     self.scheduler_config.long_prefill_token_threshold)
-            num_new_tokens = min(num_new_tokens, token_budget)
-            assert num_new_tokens > 0
+
+            # 2. Apply 256/Keep/1 Rule to get the target
+            if potential_num_new_tokens <= 0:
+                target_num_new_tokens = 0
+            elif potential_num_new_tokens == 1:
+                 target_num_new_tokens = 1
+            elif potential_num_new_tokens >= 256:
+                target_num_new_tokens = 256
+            else: # 1 < potential_num_new_tokens < 256
+                target_num_new_tokens = potential_num_new_tokens
+
+            # 3. Budget Check: Can we schedule the *entire target* amount?
+            if target_num_new_tokens <= 0 or target_num_new_tokens > token_budget:
+                # Cannot schedule this request due to zero need or insufficient budget for the target.
+                req_index += 1
+                continue # Move to the next running request
+
+            # Budget check passed, set the number of tokens we *will* schedule if resources allow
+            num_new_tokens = target_num_new_tokens
 
             # Schedule encoder inputs.
             if request.has_encoder_inputs:
@@ -249,6 +277,9 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request.request_id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
+            # if unnice number run it alone
+            if num_new_tokens > 1 and num_new_tokens < 256:
+                break
 
             # Speculative decode related.
             if request.spec_token_ids:
@@ -323,19 +354,46 @@ class Scheduler(SchedulerInterface):
                         request, num_computed_tokens))
 
                 # Total computed tokens (local + external).
-                num_computed_tokens += num_external_tokens
+                total_computed_tokens = num_computed_tokens + num_external_tokens
 
                 # Number of tokens to be scheduled.
                 # We use `request.num_tokens` instead of
                 # `request.num_prompt_tokens` to consider the resumed requests,
                 # which have output tokens.
-                num_new_tokens = request.num_tokens - num_computed_tokens
+                # num_new_tokens = request.num_tokens - num_computed_tokens
+                # print("NUM_COMPUTED_TOKENS: ", num_computed_tokens, request.num_tokens, num_new_tokens)
+                # if (0 < self.scheduler_config.long_prefill_token_threshold <
+                #         num_new_tokens):
+                #     num_new_tokens = (
+                #         self.scheduler_config.long_prefill_token_threshold)
+                # num_new_tokens = min(num_new_tokens, token_budget)
+                # assert num_new_tokens > 0
+
+                # 1. Calculate Potential Tokens needed (use num_tokens for waiting/resumed)
+                potential_num_new_tokens = request.num_tokens - total_computed_tokens
                 if (0 < self.scheduler_config.long_prefill_token_threshold <
-                        num_new_tokens):
-                    num_new_tokens = (
+                        potential_num_new_tokens):
+                    potential_num_new_tokens = (
                         self.scheduler_config.long_prefill_token_threshold)
-                num_new_tokens = min(num_new_tokens, token_budget)
-                assert num_new_tokens > 0
+
+                # 2. Apply 256/Keep/1 Rule
+                if potential_num_new_tokens <= 0:
+                     target_num_new_tokens = 0
+                elif potential_num_new_tokens == 1:
+                     target_num_new_tokens = 1
+                elif potential_num_new_tokens >= 256:
+                    target_num_new_tokens = 256
+                else: # 1 < potential_num_new_tokens < 256
+                    target_num_new_tokens = potential_num_new_tokens
+
+                # 3. Budget Check: Can we schedule the *entire target* amount?
+                if target_num_new_tokens <= 0 or target_num_new_tokens > token_budget:
+                    # Cannot schedule this or subsequent waiting requests due to need or budget.
+                    break # Exit the waiting loop
+
+                # Budget check passed
+                num_new_tokens = target_num_new_tokens
+                print("SCHEDULED NUM_NEW_TOKENS: ", num_new_tokens, request.request_id)
 
                 # Schedule encoder inputs.
                 if request.has_encoder_inputs:
@@ -456,6 +514,16 @@ class Scheduler(SchedulerInterface):
                 resumed_from_preemption=False,
             ) for req in scheduled_running_reqs
         ]
+        print(f"Scheduled {len(scheduled_new_reqs)} new requests, "
+              f"{len(scheduled_resumed_reqs)} resumed requests, "
+              f"{len(scheduled_running_reqs)} running requests, "
+              f"{len(preempted_reqs)} preempted requests, "
+              f"and {len(skipped_waiting_requests)} skipped requests. "
+              f"Total scheduled tokens: {total_num_scheduled_tokens}. "
+              f"Total budget: {self.max_num_scheduled_tokens}. \n"
+              f"Tokens per request: {num_scheduled_tokens} " # dict
+        )
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=resumed_reqs_data + running_reqs_data,

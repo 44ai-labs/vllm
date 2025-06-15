@@ -55,6 +55,51 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     maybe_prefix)
 
 
+import hashlib
+
+def get_tensor_hash(tensor: Optional[torch.Tensor], N: int = 8) -> str:
+    """
+    Computes a partial SHA256 hash of a tensor's byte representation.
+
+    Args:
+        tensor: The tensor to hash. Can be None.
+        N: The number of characters of the hex digest to return.
+
+    Returns:
+        A string representing the partial hash or 'None'.
+    """
+    if tensor is None:
+        return "None"
+    try:
+        # Detach, move to CPU, convert to numpy, get bytes
+        # Using float32 for potentially more consistent byte representation across types? Or keep original?
+        # Let's try keeping original first, requires numpy >= 1.19 for bfloat16 if used
+        tensor_cpu = tensor.detach().cpu()
+        # Cast to float32 BEFORE converting to numpy to handle bfloat16
+        # This ensures compatibility with .tobytes()
+        if tensor_cpu.dtype == torch.bfloat16:
+            tensor_for_hashing = tensor_cpu.to(dtype=torch.float32)
+        else:
+            # Keep other types as they are (assuming they are supported by numpy/tobytes)
+            # Or potentially cast all float types to float32 for consistency:
+            # tensor_for_hashing = tensor_cpu.to(dtype=torch.float32)
+            tensor_for_hashing = tensor_cpu # Keep original if not bfloat16 for now
+
+        # Convert the potentially casted tensor to numpy bytes
+        tensor_bytes = tensor_for_hashing.numpy().tobytes()
+        hasher = hashlib.sha256()
+        hasher.update(tensor_bytes)
+        # Return the first N characters of the hex digest
+        return hasher.hexdigest()[:N]
+    except Exception as e:
+        # Fallback if hashing fails (e.g., unsupported dtype for tobytes)
+        shape_str = str(tensor.shape).replace(" ", "").replace("(", "").replace(")", "").replace(",", "_")
+        print(f"Warning: Could not hash tensor {shape_str}, {tensor.dtype}. Error: {e}")
+        # Use basic info like shape and dtype as fallback identifier
+        return f"shape{shape_str}_dtype{str(tensor.dtype).split('.')[-1]}"
+
+SAVE_DIR = "debug_outputs"
+
 class LlamaMLP(nn.Module):
 
     def __init__(
@@ -346,6 +391,7 @@ class LlamaModel(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         if get_pp_group().is_first_rank:
+            # we go here :-)
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
@@ -356,17 +402,94 @@ class LlamaModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in self.layers[self.start_layer:self.end_layer]:
+        batch_groups_to_check = None
+        batch_groups = None
+        for i, layer in enumerate(self.layers[self.start_layer:self.end_layer]):
+            layer_index = self.start_layer + i
+
             hidden_states, residual = layer(positions, hidden_states, residual)
+
+            BATCH_GROUP_CHECK = False
+            if BATCH_GROUP_CHECK:
+                print("After layer", layer_index, hidden_states.shape, residual.shape if residual is not None else None)
+                # if i == 1:
+                batch_groups = {}
+                for j in range(hidden_states.shape[0]):
+                    hash_of_input = get_tensor_hash(hidden_states[j], N=8)
+                    if hash_of_input not in batch_groups:
+                        batch_groups[hash_of_input] = [j]
+                    else:
+                        batch_groups[hash_of_input].append(j)
+                # Filter out groups with only one item, as divergence requires >= 2 identical inputs
+                batch_groups_to_check = {h: idx_list for h, idx_list in batch_groups.items() if len(idx_list) > 1}
+                print(f"Batch groups after layer {i}:", batch_groups)
+
+            # --- Check for Divergence Within Initial Batch Groups (only on rank 0) ---
+            CHECK_DIVERGENCE = False # Set to False to skip divergence check
+            if CHECK_DIVERGENCE:
+                if batch_groups is not None and batch_groups_to_check: # Check if rank 0 and if there are groups to check
+                    for initial_hash, indices in batch_groups_to_check.items():
+                        # Check hidden_states divergence
+                        output_hs_hashes = set()
+                        diverged_hs = False
+                        first_hs_hash = None
+                        try:
+                            for idx in indices:
+                                if idx < hidden_states.shape[0]:
+                                    current_hash = get_tensor_hash(hidden_states[idx], N=8)
+                                    output_hs_hashes.add(current_hash)
+                                    if first_hs_hash is None:
+                                        first_hs_hash = current_hash
+                                    elif current_hash != first_hs_hash:
+                                        diverged_hs = True
+                                else:
+                                    print(f"Warning: Index {idx} out of bounds for hidden_states shape {hidden_states.shape} in layer {layer_index}")
+                        except Exception as e:
+                            print(f"Error during hidden_states hash comparison in layer {layer_index}: {e}")
+                            diverged_hs = True # Treat error as divergence
+
+                        if diverged_hs: # Faster check: stop comparing once divergence is found
+                            print(f"\nWARNING: DIVERGENCE DETECTED in Layer {layer_index} (hidden_states)!")
+                            print(f"  Inputs with initial hash {initial_hash} (Indices: {indices}) produced differing output hidden_states hashes.")
+                            print(f"  Observed output hashes: {output_hs_hashes}\n")
+                            # Potentially break checking this group or layer if only first warning is needed
+
+                        # Check residual divergence (if residual exists)
+                        if residual is not None:
+                            output_res_hashes = set()
+                            diverged_res = False
+                            first_res_hash = None
+                            try:
+                                for idx in indices:
+                                    if idx < residual.shape[0]:
+                                        current_hash = get_tensor_hash(residual[idx], N=8)
+                                        output_res_hashes.add(current_hash)
+                                        if first_res_hash is None:
+                                            first_res_hash = current_hash
+                                        elif current_hash != first_res_hash:
+                                            diverged_res = True
+                                    else:
+                                        print(f"Warning: Index {idx} out of bounds for residual shape {residual.shape} in layer {layer_index}")
+                            except Exception as e:
+                                print(f"Error during residual hash comparison in layer {layer_index}: {e}")
+                                diverged_res = True # Treat error as divergence
+
+                            if diverged_res:
+                                print(f"\nWARNING: DIVERGENCE DETECTED in Layer {layer_index} (residual)!")
+                                print(f"  Inputs with initial hash {initial_hash} (Indices: {indices}) produced differing output residual hashes.")
+                                print(f"  Observed output hashes: {output_res_hashes}\n")
+                                # Potentially break checking this group or layer
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,
                 "residual": residual
             })
-
+        
+        # Apply final layer norm
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
+
 
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> Set[str]:

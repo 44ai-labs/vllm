@@ -2,6 +2,8 @@
 """Attention layer."""
 from typing import Any, Dict, List, Optional
 
+import copy
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -130,6 +132,7 @@ class Attention(nn.Module):
                                         blocksparse_params is not None,
                                         use_mla=use_mla)
         impl_cls = attn_backend.get_impl_cls()
+        print("ATTENTION CLASS", impl_cls)
         self.impl = impl_cls(num_heads, head_size, scale, num_kv_heads,
                              alibi_slopes, sliding_window, kv_cache_dtype,
                              blocksparse_params, logits_soft_cap, attn_type,
@@ -186,6 +189,7 @@ class Attention(nn.Module):
             attn_metadata = get_forward_context().attn_metadata
             if attn_metadata.enable_kv_scales_calculation:
                 self.calc_kv_scales(query, key, value)
+        # print("attention forward", self.use_output, self.use_direct_call, self.use_mla)
         if self.use_output:
             output_shape = (output_shape
                             if output_shape is not None else query.shape)
@@ -218,6 +222,8 @@ class Attention(nn.Module):
                                   attn_metadata,
                                   output=output)
             else:
+                # here we go
+                # print("Unified attention with output", self.layer_name)
                 torch.ops.vllm.unified_attention_with_output(
                     query, key, value, output, self.layer_name)
             return output.view(-1, hidden_size)
@@ -400,7 +406,7 @@ direct_register_custom_op(
 )
 
 
-def unified_attention_with_output(
+def unified_attention_with_output_old(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -422,6 +428,214 @@ def unified_attention_with_output(
 
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
 
+import hashlib
+
+def get_tensor_hash(tensor: Optional[torch.Tensor], N: int = 8) -> str:
+    """
+    Computes a partial SHA256 hash of a tensor's byte representation.
+
+    Args:
+        tensor: The tensor to hash. Can be None.
+        N: The number of characters of the hex digest to return.
+
+    Returns:
+        A string representing the partial hash or 'None'.
+    """
+    if tensor is None:
+        return "None"
+    try:
+        # Detach, move to CPU, convert to numpy, get bytes
+        # Using float32 for potentially more consistent byte representation across types? Or keep original?
+        # Let's try keeping original first, requires numpy >= 1.19 for bfloat16 if used
+        tensor_cpu = tensor.detach().cpu()
+        # Cast to float32 BEFORE converting to numpy to handle bfloat16
+        # This ensures compatibility with .tobytes()
+        if tensor_cpu.dtype == torch.bfloat16:
+            tensor_for_hashing = tensor_cpu.to(dtype=torch.float32)
+        else:
+            # Keep other types as they are (assuming they are supported by numpy/tobytes)
+            # Or potentially cast all float types to float32 for consistency:
+            # tensor_for_hashing = tensor_cpu.to(dtype=torch.float32)
+            tensor_for_hashing = tensor_cpu # Keep original if not bfloat16 for now
+
+        # Convert the potentially casted tensor to numpy bytes
+        tensor_bytes = tensor_for_hashing.numpy().tobytes()
+        hasher = hashlib.sha256()
+        hasher.update(tensor_bytes)
+        # Return the first N characters of the hex digest
+        return hasher.hexdigest()[:N]
+    except Exception as e:
+        # Fallback if hashing fails (e.g., unsupported dtype for tobytes)
+        shape_str = str(tensor.shape).replace(" ", "").replace("(", "").replace(")", "").replace(",", "_")
+        print(f"Warning: Could not hash tensor {shape_str}, {tensor.dtype}. Error: {e}")
+        # Use basic info like shape and dtype as fallback identifier
+        return f"shape{shape_str}_dtype{str(tensor.dtype).split('.')[-1]}"
+
+def unified_attention_with_output(
+    query: torch.Tensor,     # [num_actual_tokens, num_heads, head_dim]
+    key: torch.Tensor,       # [num_actual_tokens, num_kv_heads, head_dim]
+    value: torch.Tensor,     # [num_actual_tokens, num_kv_heads, head_dim]
+    output: torch.Tensor,    # [num_actual_tokens, num_heads, head_dim]
+    layer_name: str,
+) -> None:
+    wait_for_kv_layer_from_connector(layer_name)
+    ctx = get_forward_context()
+    md_orig = ctx.attn_metadata
+    layer = ctx.no_compile_layers[layer_name]
+    kv_cache = layer.kv_cache[ctx.virtual_engine]
+
+    # If there's no metadata, just forward everything
+    if md_orig is None:
+        # print("simple attention", layer_name, query.shape, key.shape,
+        #       value.shape, output.shape, kv_cache.shape)
+        layer.impl.forward(layer, query, key, value, kv_cache, None, output=output)
+        maybe_save_kv_layer_to_connector(layer_name, kv_cache)
+        return
+
+    # How many slices?
+    qsl = md_orig.query_start_loc   # e.g. [0,256,512,768,1024]
+    num_slices = qsl.numel() - 1
+    if num_slices <= 1:
+        # single entry
+        # breakpoint()
+        # print("sizes", query.shape, key.shape, value.shape, output.shape,)
+        layer.impl.forward(layer, query, key, value, kv_cache, md_orig, output=output)
+        # hashed comparison
+        # hash_out = get_tensor_hash(output)
+        # print(f"Output hash {layer_name}", hash_out)
+        maybe_save_kv_layer_to_connector(layer_name, kv_cache)
+        return
+
+    # check if MQA
+    # FlashAttentionMetadata(
+    # num_actual_tokens=1024,
+    # max_query_len=256,
+    # query_start_loc=tensor([   0,  256,  512,  768, 1024], device='cuda:0', dtype=torch.int32),
+    # max_seq_len=256,
+    # seq_lens=tensor([256, 256, 256, 256], device='cuda:0', dtype=torch.int32),
+    # block_table=tensor([[ 1,  2,  3,  ...,  0,  0,  0],
+    # [21, 22, 23,  ...,  0,  0,  0],
+    # [41, 42, 43,  ...,  0,  0,  0],
+    # [61, 62, 63,  ...,  0,  0,  0]],
+    # device='cuda:0', dtype=torch.int32),
+    # slot_mapping=tensor([  16,   17,   18,  ..., 1229, 1230, 1231], device='cuda:0'),
+    # use_cascade=False,
+    # common_prefix_len=0,
+    # cu_prefix_query_lens=None,
+    # prefix_kv_lens=None,
+    # suffix_kv_lens=None,
+    # scheduler_metadata=None,
+    # prefix_scheduler_metadata=None,
+    # num_input_tokens=1024,
+    # local_attn_metadata=None)
+
+    # Assuming md_orig is your populated FlashAttentionMetadata object for the whole batch
+    # Assuming qsl = md_orig.query_start_loc defines the boundaries of sequences in query/key/value/output
+
+    # Multi‐query/GQA: loop each slice (sequence)
+    for i in range(num_slices):
+        # print("Processing slice", i, "of", num_slices)
+        start = int(qsl[i].item())
+        end   = int(qsl[i+1].item())
+        length = end - start # Length of the current query slice tokens
+
+        # Slice Q/K/V and the output buffer for the current sequence tokens
+        # Note: k_i, v_i might contain only the *new* tokens to be added to cache,
+        # or they might not be used directly if K/V are purely read from cache via block_table.
+        # The shape [length, num_heads|num_kv_heads, head_dim] is important.
+        q_i   = query[start:end]
+        k_i   = key[start:end] # Slicing K/V this way assumes K/V inputs also contain only current tokens
+        v_i   = value[start:end]
+        out_i = output[start:end] # View for the output of this slice
+
+        # --- Create metadata 'md' for the single sequence slice 'i' ---
+        md = copy.copy(md_orig) # Start with a shallow copy
+
+        # 1. Information about the Query slice (q_i)
+        md.num_actual_tokens = length      # Total tokens in this specific call (just q_i)
+        md.num_input_tokens  = length      # Number of tokens being processed now
+        md.max_query_len     = length      # Max query length in this *single-sequence batch*
+        md.query_start_loc   = torch.tensor([0, length], # Cumulative lengths for q_i (batch_size=1)
+                                            dtype=qsl.dtype,
+                                            device=qsl.device)
+
+        # 2. Information about the Key/Value context (KV Cache via PagedAttention)
+        # The kernel needs the actual length of sequence 'i' currently stored in the cache
+        # This information should be in the original metadata's seq_lens for sequence 'i'
+        if md_orig.seq_lens is None:
+            # This should not happen if using paged attention context, error or handle
+            raise ValueError("md_orig.seq_lens is None, cannot determine cache sequence length")
+        # Get the total length of sequence 'i' currently in the cache
+        seq_len_in_cache_i = int(md_orig.seq_lens[i].item())
+
+        # Set seq_lens for the single-sequence batch context. This tells the kernel
+        # the history length for sequence 'i'.
+        md.seq_lens = torch.tensor([seq_len_in_cache_i],
+                                  dtype=md_orig.seq_lens.dtype,
+                                  device=md_orig.seq_lens.device)
+
+        # Set the max sequence length for K for this single sequence context.
+        # This should be the length of sequence 'i' in the cache.
+        # md_orig.max_seq_len might be the max across the original batch,
+        # setting it specifically for sequence 'i' seems more accurate here.
+        md.max_seq_len = seq_len_in_cache_i # Max length for K/V for this sequence
+
+        # Slice the block_table to provide only the blocks for sequence 'i'
+        if md_orig.block_table is not None:
+            md.block_table = md_orig.block_table[i : i+1, :] # Shape becomes [1, num_blocks]
+        else:
+            # If not using block_table (e.g., pure prefill with cu_seqlens_k),
+            # ensure md.block_table is None or handle accordingly.
+            md.block_table = None
+            # If NOT using block_table, you might need cu_seqlens_k corresponding
+            # to k_i and v_i, which would be [0, length] if k_i/v_i are sliced like q_i.
+            # md.cu_seqlens_k = md.query_start_loc # If needed and no block_table
+
+        # Slice the slot_mapping. This maps the *current* query tokens (length)
+        # to their slots in the KV cache (for writing new K/V).
+        # This slicing seems correct.
+        md.slot_mapping = md_orig.slot_mapping[start:end] # Shape [length]
+
+        # 3. Slice other per-sequence metadata if present and used by the kernel
+        #    (Ensure these expect a shape starting with batch_size=1)
+        if getattr(md_orig, "prefix_kv_lens", None) is not None:
+            md.prefix_kv_lens = md_orig.prefix_kv_lens[i : i+1] # Shape [1]
+        if getattr(md_orig, "suffix_kv_lens", None) is not None:
+            md.suffix_kv_lens = md_orig.suffix_kv_lens[i : i+1] # Shape [1]
+        if getattr(md_orig, "cu_prefix_query_lens", None) is not None:
+            # Careful: This usually relates to prefix caching across the whole batch.
+            # Slicing might be complex or it might need adjustment based on single sequence.
+            # If it's [0, prefix_len_0, prefix_len_0+prefix_len_1, ...],
+            # you might need [0, prefix_len_i] for the single sequence 'i'.
+            # Consulting the specific kernel's usage is best here.
+            # Example: md.cu_prefix_query_lens = torch.tensor([0, md_orig.prefix_kv_lens[i].item()], ...)
+            pass # Placeholder - needs careful implementation if used
+
+        # --- Call the attention implementation ---
+        # The kernel should now have:
+        # - q_i: [length, num_heads, head_dim]
+        # - k_i, v_i: [length, num_kv_heads, head_dim] (representing *new* tokens, if any)
+        # - kv_cache: The full cache object (kernel uses metadata to index)
+        # - md: Metadata adjusted for a single sequence ('i') containing:
+        #   - Query info: cu_seqlens_q=[0, length], max_query_len=length
+        #   - KV Cache Context: block_table=[1, num_blocks], seq_lens=[seq_len_in_cache_i], max_seq_len=seq_len_in_cache_i
+        #   - Correct slot_mapping for q_i
+        # GQA is handled implicitly by the kernel based on head dims of q_i, k_i, v_i.
+
+        # print(f"Slice {i}: q={q_i.shape}, k={k_i.shape}, v={v_i.shape}, out={out_i.shape}")
+        # print(f"Metadata: max_q={md.max_query_len}, cu_q={md.query_start_loc}, "
+        #       f"max_k={md.max_seq_len}, seq_lens_k={md.seq_lens}, "
+        #       f"block_table_shape={md.block_table.shape if md.block_table is not None else None}")
+
+        layer.impl.forward(layer, q_i, k_i, v_i, kv_cache, md, output=out_i)
+
+        # hashed comparison
+        # hash_out = get_tensor_hash(out_i)
+        # print(f"Output hash {layer_name}", hash_out)
+
+
+
+    maybe_save_kv_layer_to_connector(layer_name, kv_cache)
 
 def unified_attention_with_output_fake(
     query: torch.Tensor,
