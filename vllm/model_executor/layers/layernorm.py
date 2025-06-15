@@ -255,7 +255,10 @@ class GemmaRMSNorm(CustomOp):
         # Go to CPU for now
         # TODO(jannis): move this to GPU
         # On GPU we either need to split it into the blocks with attention_metadata
-        variance = x.detach().cpu().pow(2).mean(dim=-1, keepdim=True).to(x.device)
+        # variance = x.detach().cpu().pow(2).mean(dim=-1, keepdim=True).to(x.device)
+        # new try as sum is a different kernel
+        sum_sq = x.pow(2).sum(dim=-1, keepdim=True)
+        variance = sum_sq / x.shape[-1]
 
         x = x * torch.rsqrt(variance + variance_epsilon)
         # Llama does x.to(float16) * w whilst Gemma is (x * w).to(float16)
