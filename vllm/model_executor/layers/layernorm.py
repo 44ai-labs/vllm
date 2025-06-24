@@ -142,7 +142,8 @@ class RMSNorm(CustomOp):
 
             x_var = x[:, :, :self.variance_size_override]
 
-        variance = x_var.pow(2).mean(dim=-1, keepdim=True)
+        sum_sq = x_var.pow(2).sum(dim=-1, keepdim=True)
+        variance = sum_sq / x.shape[-1]
 
         x = x * torch.rsqrt(variance + self.variance_epsilon)
         x = x.to(orig_dtype)
@@ -158,6 +159,8 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        if torch.are_deterministic_algorithms_enabled():
+            return self.forward_native(x, residual)
         if self.variance_size_override is not None:
             return self.forward_native(x, residual)
 
@@ -255,7 +258,8 @@ class GemmaRMSNorm(CustomOp):
             residual = x
 
         x = x.float()
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        sum_sq = x.pow(2).sum(dim=-1, keepdim=True)
+        variance = sum_sq / x.shape[-1]
         x = x * torch.rsqrt(variance + variance_epsilon)
         # Llama does x.to(float16) * w whilst Gemma is (x * w).to(float16)
         # See https://github.com/huggingface/transformers/pull/29402
@@ -277,6 +281,11 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        if torch.are_deterministic_algorithms_enabled():
+            # The static native impl is fully deterministic across
+            # any batch shape.
+            return self.forward_static(self.weight.data, self.variance_epsilon,
+                                       x, residual)
         if torch.compiler.is_compiling():
             return self.forward_native(x, residual)
 

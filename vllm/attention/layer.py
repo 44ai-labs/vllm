@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer."""
+import copy
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -444,14 +445,135 @@ def unified_attention_with_output(
         attn_metadata = attn_metadata[layer_name]
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
-    self.impl.forward(self,
-                      query,
-                      key,
-                      value,
-                      kv_cache,
-                      attn_metadata,
-                      output=output,
-                      output_scale=output_scale)
+
+    # If there's no metadata, just forward everything
+    if attn_metadata is None:
+        self.impl.forward(self,
+                          query,
+                          key,
+                          value,
+                          kv_cache,
+                          None,
+                          output=output)
+        maybe_save_kv_layer_to_connector(layer_name, kv_cache)
+        return
+
+    # How many slices?
+    qsl = attn_metadata.query_start_loc  # e.g. [0,256,512,768,1024]
+    num_slices = qsl.numel() - 1
+    if num_slices <= 1:
+        self.impl.forward(self,
+                          query,
+                          key,
+                          value,
+                          kv_cache,
+                          attn_metadata,
+                          output=output)
+        maybe_save_kv_layer_to_connector(layer_name, kv_cache)
+        return
+
+    # Multi‐query/GQA: loop each slice (sequence)
+    for i in range(num_slices):
+        # print("Processing slice", i, "of", num_slices)
+        start = int(qsl[i].item())
+        end = int(qsl[i + 1].item())
+        length = end - start  # Length of the current query slice tokens
+
+        # Slice Q/K/V and the output buffer for the current sequence tokens
+        # Note: k_i, v_i might contain only the *new* tokens to added to cache,
+        # or they might not be used directly if K/V read from
+        # cache via block_table.
+        # The shape [length, num_heads|num_kv_heads, head_dim] is important.
+        q_i = query[start:end]
+        k_i = key[start:
+                  end]  # Slicing K/V this way assumes K/V only current tokens
+        v_i = value[start:end]
+        out_i = output[start:end]  # View for the output of this slice
+
+        # --- Create metadata 'md' for the single sequence slice 'i' ---
+        md = copy.copy(attn_metadata)  # Start with a shallow copy
+
+        # 1. Information about the Query slice (q_i)
+        md.num_actual_tokens = length  # Total tokens call (just q_i)
+        md.num_input_tokens = length  # Number of tokens being processed now
+        md.max_query_len = length  # Max query length *single-sequence batch*
+        md.query_start_loc = torch.tensor(
+            [0, length],  # Cumulative lengths for q_i (batch_size=1)
+            dtype=qsl.dtype,
+            device=qsl.device)
+
+        # 2. Information about the Key/Value context (KV Cache via
+        # PagedAttention)
+        # The kernel needs the actual length of sequence 'i' currently
+        # stored in the cache
+        # This information should be in the original metadata's seq_lens
+        # for sequence 'i'
+        if attn_metadata.seq_lens is None:
+            # This should not happen if using paged attention context, error or
+            raise ValueError("md_orig.seq_lens is None, cannot determine "
+                             "cache sequence length")
+        # Get the total length of sequence 'i' currently in the cache
+        seq_len_in_cache_i = int(attn_metadata.seq_lens[i].item())
+
+        # Set seq_lens for the single-sequence batch context. This tells
+        # the kernel the history length for sequence 'i'.
+        md.seq_lens = torch.tensor([seq_len_in_cache_i],
+                                   dtype=attn_metadata.seq_lens.dtype,
+                                   device=attn_metadata.seq_lens.device)
+
+        # Set the max sequence length for K for this single sequence context.
+        # This should be the length of sequence 'i' in the cache.
+        # md_orig.max_seq_len might be the max across the original batch,
+        # setting it specifically for sequence 'i' seems more accurate here.
+        md.max_seq_len = seq_len_in_cache_i  # Max length for K/V this sequence
+
+        # Slice the block_table to provide only the blocks for sequence 'i'
+        if attn_metadata.block_table is not None:
+            md.block_table = attn_metadata.block_table[
+                i:i + 1, :]  # Shape becomes [1, num_blocks]
+        else:
+            # If not using block_table (e.g., pure prefill with cu_seqlens_k),
+            # ensure md.block_table is None or handle accordingly.
+            md.block_table = None
+            # If NOT using block_table, you might need cu_seqlens_k
+            # corresponding to k_i and v_i, which would be [0, length]
+            # if k_i/v_i are sliced like q_i.
+            # md.cu_seqlens_k = md.query_start_loc # If need and no block_table
+
+        # Slice the slot_mapping. This maps the *current* query tokens (length)
+        # to their slots in the KV cache (for writing new K/V).
+        # This slicing seems correct.
+        md.slot_mapping = attn_metadata.slot_mapping[start:
+                                                     end]  # Shape [length]
+
+        # 3. Slice other per-sequence metadata if present and used by the kernel
+        #    (Ensure these expect a shape starting with batch_size=1)
+        if getattr(attn_metadata, "prefix_kv_lens", None) is not None:
+            md.prefix_kv_lens = attn_metadata.prefix_kv_lens[i:i +
+                                                             1]  # Shape [1]
+        if getattr(attn_metadata, "suffix_kv_lens", None) is not None:
+            md.suffix_kv_lens = attn_metadata.suffix_kv_lens[i:i +
+                                                             1]  # Shape [1]
+        if getattr(attn_metadata, "cu_prefix_query_lens", None) is not None:
+            print(
+                "Warning: cu_prefix_query_lens is not used in this context, ")
+            pass  # Placeholder - needs careful implementation if used
+
+        # --- Call the attention implementation ---
+        # The kernel should now have:
+        # - q_i: [length, num_heads, head_dim]
+        # - k_i, v_i: [length, num_kv_heads, head_dim]
+        # (representing *new* tokens, if any)
+        # - kv_cache: The full cache object (kernel uses metadata to index)
+        # - md: Metadata adjusted for a single sequence ('i') containing:
+        #   - Query info: cu_seqlens_q=[0, length], max_query_len=length
+        #   - KV Cache Context: block_table=[1, num_blocks],
+        # seq_lens=[seq_len_in_cache_i], max_seq_len=seq_len_in_cache_i
+        #   - Correct slot_mapping for q_i
+        # GQA is handled implicitly by the kernel based on
+        # head dims of q_i, k_i, v_i.
+
+        self.impl.forward(self, q_i, k_i, v_i, kv_cache, md, output=out_i)
 
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
 
