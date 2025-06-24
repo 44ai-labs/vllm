@@ -202,6 +202,9 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        upper_scheduled_limit = 4
+        # our rule is upper_scheduled_limit/remainder/1
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -213,13 +216,44 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens):
                 num_new_tokens = (
                     self.scheduler_config.long_prefill_token_threshold)
+            if upper_scheduled_limit > token_budget and \
+               num_new_tokens > token_budget:
+                num_new_tokens = 0  # we ignore this request as it would break
+                # the upper_scheduled_limit/remainder/1 rule
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
+
+            # we kill the request here if we go out of max model len
+            # and have to break the rule
+            if num_new_tokens > \
+              self.max_model_len - request.num_computed_tokens \
+              and self.max_model_len - request.num_computed_tokens \
+                < upper_scheduled_limit:
+                logger.warning(
+                    "This will break the "
+                    "upper_scheduled_limit/remainder/1 rule, "
+                    "killing request %s", request.request_id)
+                request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+                self.finished_req_ids.add(request.request_id)
+                self.running.remove(request)
+                req_index += 1
+                continue
             num_new_tokens = min(
                 num_new_tokens,
                 self.max_model_len - request.num_computed_tokens)
+
+            # HANDLE RUNNING REQUESTS
+            # we apply our 4, remainder, 1 rule
+            targeted_num_new_tokens = num_new_tokens
+            if targeted_num_new_tokens >= upper_scheduled_limit:
+                num_new_tokens = upper_scheduled_limit
+            elif targeted_num_new_tokens < upper_scheduled_limit and \
+                targeted_num_new_tokens > 1:
+                num_new_tokens = targeted_num_new_tokens
+            elif targeted_num_new_tokens == 1:
+                num_new_tokens = 1
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -301,6 +335,7 @@ class Scheduler(SchedulerInterface):
             token_budget -= num_new_tokens
             req_index += 1
 
+            print(f"Scheduled request {request.request_id}, {num_new_tokens}")
             # Speculative decode related.
             if request.spec_token_ids:
                 num_scheduled_spec_tokens = (num_new_tokens +
@@ -428,8 +463,24 @@ class Scheduler(SchedulerInterface):
                         skipped_waiting_requests.prepend_request(request)
                         continue
 
+                    if upper_scheduled_limit > token_budget and \
+                        num_new_tokens > token_budget:
+                        # we cannot schedule it without breaking the rule
+                        self.waiting.pop_request()
+                        skipped_waiting_requests.prepend_request(request)
+                        continue
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
+
+                    # SCHEDULE NEW TOKENS
+                    targeted_num_new_tokens = num_new_tokens
+                    if targeted_num_new_tokens >= upper_scheduled_limit:
+                        num_new_tokens = upper_scheduled_limit
+                    elif targeted_num_new_tokens < upper_scheduled_limit and \
+                        targeted_num_new_tokens > 1:
+                        num_new_tokens = targeted_num_new_tokens
+                    elif targeted_num_new_tokens == 1:
+                        num_new_tokens = 1
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
