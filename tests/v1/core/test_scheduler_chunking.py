@@ -3,10 +3,12 @@
 from multiprocessing import Manager
 from unittest.mock import patch
 
+import pytest
+
 from vllm import LLM, SamplingParams
 from vllm.v1.core.sched.scheduler import Scheduler
 
-MODEL = "HandH1998/QQQ-Llama-3-8b-g128"  # "44ai/gemma-3-4b-it-qat-qqq"
+MODEL = "44ai/gemma-3-4b-it-qat-qqq"  # google/gemma-3-4b-it-qat-q4_0-unquantized" # "44ai/gemma-3-4b-it-qat-qqq" # 44ai/gemma-3-4b-it-qat-qqq" #  # "44ai/gemma-3-4b-it-qat-qqq" # "HandH1998/QQQ-Llama-3-8b-g128" # noqa: E501
 PROMPT = """Once upon a forgotten shoreline, where silver kelp whispered secrets to the moonlit tide, lived a cartographer named Odessa Vane. She mapped impossibilities: fault lines of thunder, reefs of mirage, and the star-shaped archipelagos that only dreamers could reach. One mist-blue dawn, a bottle bobbed onto her horizon. Inside: a clockwork scarab and a note—“Find me before the last minute breaks,” signed with the sigil of an ink-eyed sun.
 
 Curiosity outweighed caution. Odessa loaded her skiff, the Paperwing, whose sails were stitched from retired atlases, and followed the scarab’s whirring compass heart. It pointed not north, south, east, nor west, but inward, toward the Blue Between, a mythic hollow on every map. The sea flattened into mirrored glass; her reflection looked back with a stranger’s eyes. Waves peeled away like pages, revealing corridors of sky beneath.
@@ -104,5 +106,25 @@ def test_deterministic_chunking(mocker):
             print("Scheduler chunking patterns:")
             print(scheduler_chunking)
 
+            for key, values in scheduler_chunking.items():
+                assert not any([v > 4 for v in values]), (
+                    f"Unexpected chunk size > 4 for {key}: {values}")
+                prev = values[0]
+                for v in values[1:]:
+                    assert v <= prev, (
+                        f"Unexpected chunk size increase for {key}: {prev} -> "
+                        f"{v}")
+                    prev = v
+                # only one is remainder
+                set_values = set(values)
+                print(f"set of values for {key}: {set_values}")
+                assert len(set_values) <= 3, (
+                    f"Unexpected chunk sizes for {key}: {set_values}")
+            print("SUCCESS: correct chunking patterns")
+
             if total_diffs == 0:
                 print("SUCCESS All logprobs requests match across outputs.")
+            else:
+                pytest.fail(
+                    f"Logprobs requests mismatch across outputs: {total_diffs} "
+                    "mismatches found.")
