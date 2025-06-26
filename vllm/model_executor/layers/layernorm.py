@@ -8,6 +8,7 @@ import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers.variance import variance_deterministic
 from vllm.platforms import current_platform
 
 
@@ -259,8 +260,11 @@ class GemmaRMSNorm(CustomOp):
             residual = x
 
         x = x.float()
-        sum_sq = x.pow(2).sum(dim=-1, keepdim=True)
-        variance = sum_sq / x.shape[-1]
+        # sum_sq = x.pow(2).sum(dim=-1, keepdim=True)
+        # variance = sum_sq / x.shape[-1]
+        # variance = x.detach().cpu().
+        # pow(2).mean(dim=-1, keepdim=True).to(x.device)
+        variance = variance_deterministic(x, block_size=1024)
         x = x * torch.rsqrt(variance + variance_epsilon)
         # Llama does x.to(float16) * w whilst Gemma is (x * w).to(float16)
         # See https://github.com/huggingface/transformers/pull/29402
