@@ -2123,6 +2123,10 @@ class SchedulerConfig:
     like full attention and sliding window attention.
     """
 
+    upper_scheduled_limit: SkipValidation[int] = None
+    """Maximum number of token scheduled in a single step for the 
+    Upper/remainder/1 Rule"""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

@@ -192,7 +192,8 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
-        upper_scheduled_limit = 4
+        upper_scheduled_limit = (
+            self.vllm_config.scheduler_config.upper_scheduled_limit)
         # our rule is upper_scheduled_limit/remainder/1
 
         # First, schedule the RUNNING requests.
@@ -206,7 +207,8 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens):
                 num_new_tokens = (
                     self.scheduler_config.long_prefill_token_threshold)
-            if upper_scheduled_limit > token_budget and \
+            if upper_scheduled_limit and \
+               upper_scheduled_limit > token_budget and \
                num_new_tokens > token_budget:
                 num_new_tokens = 0  # we ignore this request as it would break
                 # the upper_scheduled_limit/remainder/1 rule
@@ -236,14 +238,15 @@ class Scheduler(SchedulerInterface):
 
             # HANDLE RUNNING REQUESTS
             # we apply our 4, remainder, 1 rule
-            targeted_num_new_tokens = num_new_tokens
-            if targeted_num_new_tokens >= upper_scheduled_limit:
-                num_new_tokens = upper_scheduled_limit
-            elif targeted_num_new_tokens < upper_scheduled_limit and \
-                targeted_num_new_tokens > 1:
-                num_new_tokens = targeted_num_new_tokens
-            elif targeted_num_new_tokens == 1:
-                num_new_tokens = 1
+            if upper_scheduled_limit is not None:
+                targeted_num_new_tokens = num_new_tokens
+                if targeted_num_new_tokens >= upper_scheduled_limit:
+                    num_new_tokens = upper_scheduled_limit
+                elif targeted_num_new_tokens < upper_scheduled_limit and \
+                    targeted_num_new_tokens > 1:
+                    num_new_tokens = targeted_num_new_tokens
+                elif targeted_num_new_tokens == 1:
+                    num_new_tokens = 1
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -438,7 +441,8 @@ class Scheduler(SchedulerInterface):
                         num_new_tokens = (
                             self.scheduler_config.long_prefill_token_threshold)
 
-                    if upper_scheduled_limit > token_budget and \
+                    if upper_scheduled_limit and \
+                       upper_scheduled_limit > token_budget and \
                         num_new_tokens > token_budget:
                         # we cannot schedule it without breaking the rule
                         self.waiting.popleft()
@@ -448,14 +452,15 @@ class Scheduler(SchedulerInterface):
                     assert num_new_tokens > 0
 
                     # SCHEDULE NEW TOKENS
-                    targeted_num_new_tokens = num_new_tokens
-                    if targeted_num_new_tokens >= upper_scheduled_limit:
-                        num_new_tokens = upper_scheduled_limit
-                    elif targeted_num_new_tokens < upper_scheduled_limit and \
-                        targeted_num_new_tokens > 1:
-                        num_new_tokens = targeted_num_new_tokens
-                    elif targeted_num_new_tokens == 1:
-                        num_new_tokens = 1
+                    if upper_scheduled_limit is not None:
+                        targeted_num_new_tokens = num_new_tokens
+                        if targeted_num_new_tokens >= upper_scheduled_limit:
+                            num_new_tokens = upper_scheduled_limit
+                        elif targeted_num_new_tokens < upper_scheduled_limit \
+                            and targeted_num_new_tokens > 1:
+                            num_new_tokens = targeted_num_new_tokens
+                        elif targeted_num_new_tokens == 1:
+                            num_new_tokens = 1
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:

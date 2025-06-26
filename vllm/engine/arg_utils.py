@@ -443,6 +443,8 @@ class EngineArgs:
     enable_multimodal_encoder_data_parallel: bool = \
         ParallelConfig.enable_multimodal_encoder_data_parallel
 
+    upper_scheduled_limit: int = SchedulerConfig.upper_scheduled_limit
+
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
@@ -855,6 +857,9 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--disable-hybrid-kv-cache-manager",
             **scheduler_kwargs["disable_hybrid_kv_cache_manager"])
+        scheduler_group.add_argument(
+            "--upper-scheduled-limit",
+            **scheduler_kwargs["upper_scheduled_limit"])
 
         # vLLM arguments
         vllm_kwargs = get_kwargs(VllmConfig)
@@ -1182,6 +1187,7 @@ class EngineArgs:
             long_prefill_token_threshold=self.long_prefill_token_threshold,
             disable_hybrid_kv_cache_manager=self.
             disable_hybrid_kv_cache_manager,
+            upper_scheduled_limit=self.upper_scheduled_limit,
         )
 
         lora_config = LoRAConfig(
