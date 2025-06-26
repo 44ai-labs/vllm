@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from multiprocessing import Manager
 from unittest.mock import patch
 
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = (
+    ":4096:8"  # :4096:8 allocates a 4 KiB workspace with 8-byte alignment.
+)
 import pytest
-
-from vllm import LLM, SamplingParams
-from vllm.v1.core.sched.scheduler import Scheduler
+# os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
+import torch
 
 MODEL = "44ai/gemma-3-4b-it-qat-qqq"  # google/gemma-3-4b-it-qat-q4_0-unquantized" # "44ai/gemma-3-4b-it-qat-qqq" # 44ai/gemma-3-4b-it-qat-qqq" #  # "44ai/gemma-3-4b-it-qat-qqq" # "HandH1998/QQQ-Llama-3-8b-g128" # noqa: E501
 PROMPT = """Once upon a forgotten shoreline, where silver kelp whispered secrets to the moonlit tide, lived a cartographer named Odessa Vane. She mapped impossibilities: fault lines of thunder, reefs of mirage, and the star-shaped archipelagos that only dreamers could reach. One mist-blue dawn, a bottle bobbed onto her horizon. Inside: a clockwork scarab and a note—“Find me before the last minute breaks,” signed with the sigil of an ink-eyed sun.
@@ -19,6 +22,12 @@ There she met Captain Edrin Kestrel, rumored dead many times, who helmed the Lac
 # uv pip install pytest-mock
 def test_deterministic_chunking(mocker):
     """Verify the 256 / remainder pattern during prefill is deterministic."""
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True)
+
+    from vllm import LLM, SamplingParams
+    from vllm.v1.core.sched.scheduler import Scheduler
     with (Manager() as manager
           ):  # as there is a fork when launching LLM so we need a manager
         captured = manager.list()
@@ -36,29 +45,32 @@ def test_deterministic_chunking(mocker):
             new_scheduler_cls.schedule = recorder
             return new_scheduler_cls
 
+        # if patch does not work, it could be due to some additional
+        # quant_config reduce it to a minimum, GPTQModel puts out way to much
         with patch("vllm.v1.engine.core.resolve_obj_by_qualname",
                    new=scheduler_init):
             llm = LLM(
                 MODEL,
                 enforce_eager=True,
-                enable_prefix_caching=True,
+                enable_prefix_caching=False,
                 dtype="half",
                 # long_prefill_token_threshold=2,
                 max_num_batched_tokens=10,
-                max_num_seqs=4,
+                max_num_seqs=3,
                 # block_size=16,
                 gpu_memory_utilization=0.3,
-            )
+                limit_mm_per_prompt={"image": 0})
 
             seed = 4419
             sampling_params = SamplingParams(
-                temperature=0.0,
+                temperature=0.5,
                 top_p=0.95,
                 seed=seed,
                 max_tokens=32,  # 1024,
                 logprobs=20,
             )
-            _outputs = llm.generate([PROMPT] * 5,
+            print("------ STARTING GENERATION ------")
+            _outputs = llm.generate([PROMPT] * 3,
                                     sampling_params=sampling_params)
             logprobs_storage = []
             for output in _outputs:
