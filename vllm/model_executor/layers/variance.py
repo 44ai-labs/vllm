@@ -2,8 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
-from vllm.triton_utils import triton
-from vllm.triton_utils.trition import language as tl
+from vllm.triton_utils import tl, triton
 
 
 ################################################################################
