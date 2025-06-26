@@ -20,7 +20,17 @@ There she met Captain Edrin Kestrel, rumored dead many times, who helmed the Lac
 
 
 # uv pip install pytest-mock
-def test_deterministic_chunking(mocker):
+@pytest.mark.parametrize(
+    ("prompt_cnt", "max_num_seqs", "max_num_batched_tokens",
+     "upper_scheduled_limit"),
+    [
+        (3, 3, 10, 4),  # default values
+        (3, 3, 10, 2),  # upper_scheduled_limit
+        (100, 256, 8192, 8129),  # normal defaults
+    ])
+def test_deterministic_chunking(prompt_cnt, max_num_seqs,
+                                max_num_batched_tokens, upper_scheduled_limit,
+                                mocker):
     """Verify the 256 / remainder pattern during prefill is deterministic."""
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
@@ -45,6 +55,8 @@ def test_deterministic_chunking(mocker):
             new_scheduler_cls.schedule = recorder
             return new_scheduler_cls
 
+        upper_scheduled_limit = upper_scheduled_limit
+
         # if patch does not work, it could be due to some additional
         # quant_config reduce it to a minimum, GPTQModel puts out way to much
         with patch("vllm.v1.engine.core.resolve_obj_by_qualname",
@@ -52,14 +64,16 @@ def test_deterministic_chunking(mocker):
             llm = LLM(
                 MODEL,
                 enforce_eager=True,
-                enable_prefix_caching=False,
+                enable_prefix_caching=True,
                 dtype="half",
                 # long_prefill_token_threshold=2,
-                max_num_batched_tokens=10,
-                max_num_seqs=3,
+                max_num_batched_tokens=max_num_batched_tokens,
+                max_num_seqs=max_num_seqs,
                 # block_size=16,
                 gpu_memory_utilization=0.3,
-                limit_mm_per_prompt={"image": 0})
+                limit_mm_per_prompt={"image": 0},
+                upper_scheduled_limit=upper_scheduled_limit,
+            )
 
             seed = 4419
             sampling_params = SamplingParams(
@@ -70,7 +84,7 @@ def test_deterministic_chunking(mocker):
                 logprobs=20,
             )
             print("------ STARTING GENERATION ------")
-            _outputs = llm.generate([PROMPT] * 3,
+            _outputs = llm.generate([PROMPT] * prompt_cnt,
                                     sampling_params=sampling_params)
             logprobs_storage = []
             for output in _outputs:
@@ -119,8 +133,9 @@ def test_deterministic_chunking(mocker):
             print(scheduler_chunking)
 
             for key, values in scheduler_chunking.items():
-                assert not any([v > 4 for v in values]), (
-                    f"Unexpected chunk size > 4 for {key}: {values}")
+                assert not any([v > upper_scheduled_limit for v in values]), (
+                    f"Unexpected chunk size > {upper_scheduled_limit} "
+                    f"for {key}: {values}")
                 prev = values[0]
                 for v in values[1:]:
                     assert v <= prev, (
