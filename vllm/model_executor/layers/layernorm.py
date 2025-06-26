@@ -264,7 +264,10 @@ class GemmaRMSNorm(CustomOp):
         # variance = sum_sq / x.shape[-1]
         # variance = x.detach().cpu().
         # pow(2).mean(dim=-1, keepdim=True).to(x.device)
-        variance = variance_deterministic(x, block_size=1024)
+        if torch.are_deterministic_algorithms_enabled():
+            variance = variance_deterministic(x, block_size=1024)
+        else:
+            variance = x.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + variance_epsilon)
         # Llama does x.to(float16) * w whilst Gemma is (x * w).to(float16)
         # See https://github.com/huggingface/transformers/pull/29402

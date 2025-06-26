@@ -439,6 +439,16 @@ def unified_attention_with_output(
         attn_metadata = attn_metadata[layer_name]
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
+    if not torch.are_deterministic_algorithms_enabled():
+        self.impl.forward(self,
+                          query,
+                          key,
+                          value,
+                          kv_cache,
+                          attn_metadata,
+                          output=output)
+        maybe_save_kv_layer_to_connector(layer_name, kv_cache)
+        return
 
     # If there's no metadata, just forward everything
     if attn_metadata is None:
