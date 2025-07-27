@@ -214,7 +214,7 @@ class SamplingParams(
     last token of a corresponding token sequence is not allowed when the next
     generated token can complete the sequence."""
     _bad_words_token_ids: Optional[list[list[int]]] = None
-    
+
     # beam search parameters
     use_beam_search: bool = False
     beam_size: int = 5
