@@ -507,68 +507,79 @@ class OpenAISpeechToText(OpenAIServing):
                                            eos_token_id: Optional[int],
                                            logprob_threshold: float,
                                            max_beam_tokens: int) -> None:
-        """Process parallel beam generation tasks."""
+        """Process parallel beam generation tasks efficiently."""
+
+        # Process all tasks concurrently using gather for better performance
+        async def process_single_task(task_idx: int, result_generator) -> None:
+            """Process a single beam generation task."""
+            beam_idx, beam_tokens, beam_logprob = beam_indices[task_idx]
+
+            try:
+                async for result in result_generator:
+                    output = result.outputs[0] if result.outputs else None
+                    if not output or not output.logprobs:
+                        new_beams.append((beam_tokens, beam_logprob, True))
+                        return
+
+                    # Process logprobs efficiently
+                    candidates_added = self._process_beam_candidates(
+                        beam_tokens, beam_logprob, output.logprobs[0],
+                        eos_token_id, logprob_threshold, max_beam_tokens,
+                        output.finish_reason, new_beams)
+
+                    print(f"Beam {beam_idx}: added {candidates_added} "
+                          f"candidates")
+                    return
+
+            except Exception as e:
+                print(f"Error in beam {beam_idx}: {e}")
+                new_beams.append((beam_tokens, beam_logprob, True))
+
+        # Run all tasks concurrently for better performance
         try:
-            # Wait for all generation tasks to complete
-            for task_idx, result_generator in enumerate(generation_tasks):
-                beam_idx, beam_tokens, beam_logprob = beam_indices[task_idx]
-
-                try:
-                    async for result in result_generator:
-                        if result.outputs and len(result.outputs) > 0:
-                            output = result.outputs[0]
-
-                            if output.logprobs and len(output.logprobs) > 0:
-                                # Extract top candidates from logprobs
-                                logprobs_dict = output.logprobs[0]
-
-                                total_candidates = len(logprobs_dict)
-                                filtered_candidates = 0
-
-                                for token_id, logprob_data in (
-                                        logprobs_dict.items()):
-                                    # Skip tokens with very low probability
-                                    if logprob_data.logprob < logprob_threshold:
-                                        continue
-
-                                    filtered_candidates += 1
-                                    new_beam_tokens = beam_tokens + [token_id]
-                                    new_beam_logprob = (beam_logprob +
-                                                        logprob_data.logprob)
-
-                                    is_beam_finished = False
-
-                                    # Check if this is an EOS token
-                                    if (eos_token_id is not None
-                                            and token_id == eos_token_id):
-                                        is_beam_finished = True
-
-                                    # Check other finish conditions
-                                    if (output.finish_reason is not None and
-                                            output.finish_reason != "length"):
-                                        is_beam_finished = True
-                                    if len(new_beam_tokens) >= max_beam_tokens:
-                                        is_beam_finished = True
-
-                                    new_beams.append(
-                                        (new_beam_tokens, new_beam_logprob,
-                                         is_beam_finished))
-
-                                print(f"Beam {beam_idx}: filtered "
-                                      f"{filtered_candidates}/"
-                                      f"{total_candidates} "
-                                      f"candidates")
-                        break
-                except Exception as e:
-                    print(
-                        f"Error generating token for beam {beam_tokens}: {e}")
-                    new_beams.append((beam_tokens, beam_logprob, True))
-                    continue
+            await asyncio.gather(*[
+                process_single_task(idx, task)
+                for idx, task in enumerate(generation_tasks)
+            ],
+                                 return_exceptions=True)
         except Exception as e:
-            print(f"Error in parallel generation: {e}")
-            # Fallback: mark all remaining beams as finished
+            print(f"Error in parallel beam processing: {e}")
+            # Fallback: mark remaining beams as finished
             for beam_idx, beam_tokens, beam_logprob in beam_indices:
                 new_beams.append((beam_tokens, beam_logprob, True))
+
+    def _process_beam_candidates(self, beam_tokens: list, beam_logprob: float,
+                                 logprobs_dict: dict,
+                                 eos_token_id: Optional[int],
+                                 logprob_threshold: float,
+                                 max_beam_tokens: int,
+                                 finish_reason: Optional[str],
+                                 new_beams: list) -> int:
+        """Process candidates for a single beam efficiently."""
+        candidates_added = 0
+
+        # Pre-filter candidates by logprob threshold for efficiency
+        valid_candidates = [
+            (token_id, logprob_data)
+            for token_id, logprob_data in logprobs_dict.items()
+            if logprob_data.logprob >= logprob_threshold
+        ]
+
+        for token_id, logprob_data in valid_candidates:
+            new_beam_tokens = beam_tokens + [token_id]
+            new_beam_logprob = beam_logprob + logprob_data.logprob
+
+            # Determine if beam should finish
+            is_beam_finished = (
+                (eos_token_id is not None and token_id == eos_token_id)
+                or (finish_reason is not None and finish_reason != "length")
+                or (len(new_beam_tokens) >= max_beam_tokens))
+
+            new_beams.append(
+                (new_beam_tokens, new_beam_logprob, is_beam_finished))
+            candidates_added += 1
+
+        return candidates_added
 
     def _create_beam_result_generators(
             self, beam_results: list, prompts: list[PromptType],
