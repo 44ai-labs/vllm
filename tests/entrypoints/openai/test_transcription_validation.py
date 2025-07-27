@@ -393,7 +393,7 @@ async def test_beam_search_timing(mary_had_lamb, model_name):
         for i in range(5):
             mary_had_lamb.seek(0)  # Reset file pointer
             start_time = time.time()
-            _transcription_regular = await client.audio.transcriptions.create(
+            transcription_regular = await client.audio.transcriptions.create(
                 model=model_name,
                 file=mary_had_lamb,
                 language="en",
@@ -409,7 +409,7 @@ async def test_beam_search_timing(mary_had_lamb, model_name):
         for i in range(5):
             mary_had_lamb.seek(0)  # Reset file pointer
             start_time = time.time()
-            _transcription_beam = await client.audio.transcriptions.create(
+            transcription_beam = await client.audio.transcriptions.create(
                 model=model_name,
                 file=mary_had_lamb,
                 language="en",
@@ -431,3 +431,7 @@ async def test_beam_search_timing(mary_had_lamb, model_name):
         print(f"Regular transcription average: {avg_regular:.2f}s")
         print(f"Beam search average: {avg_beam:.2f}s")
         print(f"Beam search is {avg_beam/avg_regular:.1f}x slower")
+        out_regular = json.loads(transcription_regular)['text']
+        out_beam = json.loads(transcription_beam)['text']
+        print(f"Regular transcription: {out_regular}")
+        print(f"Beam search transcription: {out_beam}")
