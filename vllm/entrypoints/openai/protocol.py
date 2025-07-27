@@ -2188,7 +2188,7 @@ class TranscriptionRequest(OpenAIBaseModel):
         if any(bool(data.get(so, False)) for so in stream_opts) and not stream:
             raise ValueError(
                 "Stream options can only be defined when `stream=True`.")
-        
+
         # Validate beam search + streaming combination
         use_beam_search = data.get("use_beam_search", False)
         if use_beam_search and stream:

@@ -226,7 +226,7 @@ class SamplingParams(
     # Fields used for bad words
     bad_words: Optional[list[str]] = None
     _bad_words_token_ids: Optional[list[list[int]]] = None
-    
+
     # beam search parameters
     use_beam_search: bool = False
     beam_size: int = 5
