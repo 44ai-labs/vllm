@@ -12,7 +12,6 @@ import numpy as np
 from fastapi import Request
 
 import vllm.envs as envs
-from vllm.sampling_params import SamplingParams
 from vllm.config import ModelConfig
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.logger import RequestLogger
@@ -27,7 +26,8 @@ from vllm.entrypoints.openai.serving_models import OpenAIServingModels
 from vllm.inputs.data import PromptType
 from vllm.logger import init_logger
 from vllm.model_executor.models import SupportsTranscription
-from vllm.outputs import RequestOutput, CompletionOutput
+from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.sampling_params import SamplingParams
 from vllm.utils import PlaceholderModule
 
 try:
@@ -185,179 +185,13 @@ class OpenAISpeechToText(OpenAIServing):
                 if request.stream:
                     return self.create_error_response(
                         "Streaming is not supported for beam search.")
-                # TODO: check if prefix caching is enabled, and give warning when not
+                # TODO: check if prefix caching is enabled, and give
+                # warning when not
                 # "fake" beam search only works with prefix caching enabled
-                
-                # Implement beam search with token-by-token generation and top_k selection
-                beam_results = []
-                
-                for prompt_idx, prompt in enumerate(prompts):
-                    # Initialize beam with empty tokens list  
-                    # Each beam element: (tokens, cumulative_logprob, is_finished)
-                    beams = [([], 0.0, False)]
-                    
-                    # Generate tokens one by one up to max_tokens
-                    max_beam_tokens = min(sampling_params.max_tokens or 100, 100)
-                    print(f"Starting beam search for prompt {prompt_idx} with max tokens {max_beam_tokens}")
-                    print(f"prompt: {prompt}")
-                    for step in range(max_beam_tokens):
-                        if not beams or all(beam[2] for beam in beams):  # All beams finished
-                            break
-                            
-                        # Prepare candidates for this step
-                        new_beams = []
-                        
-                        print(f"Step {step + 1}/{max_beam_tokens} for prompt {prompt_idx}, current beams: {len(beams)}")
-                        # For each current beam that isn't finished, generate next token candidates
-                        for beam_tokens, beam_logprob, is_finished in beams:
-                            print(f"Processing beam: {beam_tokens}, logprob: {beam_logprob}, finished: {is_finished}")
-                            if is_finished:
-                                # Keep finished beams as-is
-                                new_beams.append((beam_tokens, beam_logprob, True))
-                                continue
-                                
-                            # Create current prompt + generated tokens so far
-                            if not isinstance(prompt, dict) or "multi_modal_data" not in prompt or "prompt_token_ids" not in prompt:
-                                raise ValueError(
-                                    "Beam search requires prompts to be in dict format with 'prompt_token_ids' and 'multi_modal_data'.")
-                            
-                            # Handle regular prompt with multi_modal_data
-                            current_prompt = {
-                                "prompt_token_ids": prompt["prompt_token_ids"] + beam_tokens,
-                                "multi_modal_data": prompt.get("multi_modal_data", {})
-                            }
 
-                            
-                            # Create sampling params for getting logprobs (top_k candidates)
-                            beam_sampling_params = SamplingParams(
-                                max_tokens=1,  # Generate only one token
-                                temperature=0.0,  # Use greedy for more stable results
-                                top_k=beam_size * 2,  # Get more candidates than beam size
-                                logprobs=beam_size * 2,  # Get logprobs for top candidates
-                                n=1,
-                            )
-
-                            # breakpoint()
-                            
-                            try:
-                                # Generate one token with logprobs
-                                result_generator = self.engine_client.generate(
-                                    current_prompt,
-                                    beam_sampling_params,
-                                    f"{request_id}-beam-{prompt_idx}-{step}-{len(beam_tokens)}"
-                                )
-                                
-                                # Get the result
-                                async for result in result_generator:
-                                    # print(f"Processing result of generator: {result}")
-                                    if result.outputs and len(result.outputs) > 0:
-                                        output = result.outputs[0]
-                                        print(f"Beam search step {step + 1}, output: {output}")
-                                        
-                                        if output.logprobs and len(output.logprobs) > 0:
-                                            # Extract top candidates from logprobs
-                                            logprobs_dict = output.logprobs[0]
-                                            
-                                            # Get EOS token ID from tokenizer for proper beam finishing
-                                            try:
-                                                from vllm.transformers_utils.tokenizer import get_tokenizer
-                                                tokenizer = get_tokenizer(
-                                                    tokenizer_name=self.model_config.tokenizer,
-                                                    tokenizer_mode=self.model_config.tokenizer_mode,
-                                                    trust_remote_code=self.model_config.trust_remote_code,
-                                                    revision=self.model_config.tokenizer_revision
-                                                )
-                                                eos_token_id = tokenizer.eos_token_id
-                                            except Exception:
-                                                eos_token_id = None
-                                                
-                                            for token_id, logprob_data in logprobs_dict.items():
-                                                new_beam_tokens = beam_tokens + [token_id]
-                                                new_beam_logprob = beam_logprob + logprob_data.logprob
-                                                
-                                                is_beam_finished = False
-                                                
-                                                # Check if this is an EOS token
-                                                if eos_token_id is not None and token_id == eos_token_id:
-                                                    is_beam_finished = True
-                                                    print(f"Beam finished with EOS token {token_id}")
-                                                
-                                                # Check other finish conditions
-                                                if output.finish_reason is not None and output.finish_reason != "length": # as we only generate one token
-                                                    is_beam_finished = True
-                                                if len(new_beam_tokens) >= max_beam_tokens:
-                                                    is_beam_finished = True
-                                                
-                                                new_beams.append((new_beam_tokens, new_beam_logprob, is_beam_finished))
-                            except Exception as e:
-                                print(f"Error generating token for beam {beam_tokens}: {e}")
-                                # If generation fails, keep the current beam
-                                new_beams.append((beam_tokens, beam_logprob, True))
-                                continue
-                        
-                        # Select top beam_size beams based on cumulative logprob
-                        # Sort by logprob (higher is better) and take top beam_size
-                        new_beams.sort(key=lambda x: x[1], reverse=True)
-                        beams = new_beams[:beam_size]
-                        
-                        # If no beams left, break
-                        if not beams:
-                            break
-                    
-                    # Store the best beam for this prompt
-                    if beams:
-                        print(f"Best beam for prompt {prompt_idx}: {beams[0]}")
-                        best_beam = max(beams, key=lambda x: x[1])  # Best by logprob
-                        beam_results.append(best_beam)
-                    else:
-                        beam_results.append(([], 0.0, True))  # Empty result
-
-                # Generate final results using the beam search outputs
-                list_result_generator = []
-                for prompt_idx, (best_tokens, best_logprob, _) in enumerate(beam_results):
-                    # Create a simple async generator that yields the beam search result
-                    # Use default arguments to capture values by value, not reference
-                    async def create_beam_result(tokens=best_tokens, logprob=best_logprob, idx=prompt_idx):
-                        if tokens:
-                            # Decode the best tokens using the tokenizer
-                            try:
-                                from vllm.transformers_utils.tokenizer import get_tokenizer
-                                tokenizer = get_tokenizer(
-                                    tokenizer_name=self.model_config.tokenizer,
-                                    tokenizer_mode=self.model_config.tokenizer_mode,
-                                    trust_remote_code=self.model_config.trust_remote_code,
-                                    revision=self.model_config.tokenizer_revision
-                                )
-                                generated_text = tokenizer.decode(tokens, skip_special_tokens=True)
-                            except Exception as e:
-                                logger.warning(f"Failed to decode tokens {tokens}: {e}")
-                                # Fallback: convert tokens to string representation
-                                generated_text = " ".join(str(token) for token in tokens)
-                        else:
-                            generated_text = ""
-                        
-                        completion_output = CompletionOutput(
-                            index=0,
-                            text=generated_text,
-                            token_ids=tokens,
-                            cumulative_logprob=logprob,
-                            logprobs=None,  # Could include detailed logprobs if needed
-                            finish_reason="stop" if tokens else "length"
-                        )
-                        
-                        request_output = RequestOutput(
-                            request_id=f"{request_id}-beam-{idx}",
-                            prompt=prompts[idx],
-                            prompt_token_ids=[],  # Would need proper tokenization
-                            prompt_logprobs=None,
-                            outputs=[completion_output],
-                            finished=True
-                        )
-                        
-                        yield request_output
-                    
-                    list_result_generator.append(create_beam_result())
-                
+                # Perform beam search with the new method
+                list_result_generator = await self._perform_beam_search(
+                    prompts, sampling_params, request_id, beam_size)
             else:
                 list_result_generator = [
                     self.engine_client.generate(
@@ -545,3 +379,256 @@ class OpenAISpeechToText(OpenAIServing):
                 quietest_idx = i + start_idx
                 min_energy = energy
         return quietest_idx
+
+    async def _perform_beam_search(
+            self, prompts: list[PromptType], sampling_params: SamplingParams,
+            request_id: str,
+            beam_size: int) -> list[AsyncGenerator[RequestOutput, None]]:
+        """Perform beam search for speech-to-text generation.
+        
+        Args:
+            prompts: List of prompts to process
+            sampling_params: Sampling parameters for generation
+            request_id: Request ID for tracking
+            beam_size: Number of beams to maintain
+            
+        Returns:
+            List of async generators for beam search results
+        """
+        # Optimization 1: Get tokenizer once for the complete beam search
+        try:
+            from vllm.transformers_utils.tokenizer import get_tokenizer
+            tokenizer = get_tokenizer(
+                tokenizer_name=self.model_config.tokenizer,
+                tokenizer_mode=self.model_config.tokenizer_mode,
+                trust_remote_code=self.model_config.trust_remote_code,
+                revision=self.model_config.tokenizer_revision)
+            eos_token_id = tokenizer.eos_token_id
+        except Exception:
+            tokenizer = None
+            eos_token_id = None
+
+        # Optimization 3: Set logprob threshold to filter out low-probability
+        # candidates
+        logprob_threshold = -10.0
+
+        beam_results = []
+
+        for prompt_idx, prompt in enumerate(prompts):
+            # Initialize beam with empty tokens list
+            # Each beam element: (tokens, cumulative_logprob, is_finished)
+            beams = [([], 0.0, False)]
+
+            # Generate tokens one by one up to max_tokens
+            max_beam_tokens = sampling_params.max_tokens
+            print(f"Starting beam search for prompt {prompt_idx} "
+                  f"with max tokens {max_beam_tokens}")
+            print(f"prompt: {prompt}")
+
+            for step in range(max_beam_tokens):
+                if not beams or all(beam[2] for beam in beams):
+                    break  # All beams finished
+
+                new_beams = []
+                print(f"Step {step + 1}/{max_beam_tokens} for prompt "
+                      f"{prompt_idx}, current beams: {len(beams)}")
+
+                # Optimization 2: Run beam requests in parallel
+                generation_tasks = []
+                beam_indices = []
+
+                # Prepare generation tasks for each active beam
+                for beam_idx, (beam_tokens, beam_logprob,
+                               is_finished) in enumerate(beams):
+                    if is_finished:
+                        new_beams.append((beam_tokens, beam_logprob, True))
+                        continue
+
+                    # Validate prompt format
+                    if (not isinstance(prompt, dict)
+                            or "multi_modal_data" not in prompt
+                            or "prompt_token_ids" not in prompt):
+                        raise ValueError(
+                            "Beam search requires prompts to be in dict "
+                            "format with 'prompt_token_ids' and "
+                            "'multi_modal_data'.")
+
+                    # Create current prompt + generated tokens so far
+                    current_prompt = {
+                        "prompt_token_ids":
+                        (prompt["prompt_token_ids"] + beam_tokens),
+                        "multi_modal_data":
+                        prompt.get("multi_modal_data", {})
+                    }
+
+                    # Create sampling params for getting logprobs
+                    beam_sampling_params = SamplingParams(
+                        max_tokens=1,  # Generate only one token
+                        temperature=0.0,  # Use greedy for stability
+                        top_k=beam_size * 2,  # Get more candidates
+                        logprobs=beam_size * 2,  # Get logprobs for candidates
+                        n=1,
+                    )
+
+                    # Create generation task
+                    generation_task = self.engine_client.generate(
+                        current_prompt, beam_sampling_params,
+                        f"{request_id}-beam-{prompt_idx}-{step}-{beam_idx}")
+                    generation_tasks.append(generation_task)
+                    beam_indices.append((beam_idx, beam_tokens, beam_logprob))
+
+                # Run all generation tasks in parallel and collect results
+                if generation_tasks:
+                    await self._process_parallel_beam_tasks(
+                        generation_tasks, beam_indices, new_beams,
+                        eos_token_id, logprob_threshold, max_beam_tokens)
+
+                # Select top beam_size beams based on cumulative logprob
+                new_beams.sort(key=lambda x: x[1], reverse=True)
+                beams = new_beams[:beam_size]
+
+                if not beams:
+                    break
+
+            # Store the best beam for this prompt
+            if beams:
+                best_beam = max(beams, key=lambda x: x[1])  # Best by logprob
+                print(f"Best beam for prompt {prompt_idx}: {best_beam}")
+                beam_results.append(best_beam)
+            else:
+                beam_results.append(([], 0.0, True))  # Empty result
+
+        # Generate final results using the beam search outputs
+        return self._create_beam_result_generators(beam_results, prompts,
+                                                   request_id, tokenizer)
+
+    async def _process_parallel_beam_tasks(self, generation_tasks: list,
+                                           beam_indices: list, new_beams: list,
+                                           eos_token_id: Optional[int],
+                                           logprob_threshold: float,
+                                           max_beam_tokens: int) -> None:
+        """Process parallel beam generation tasks."""
+        try:
+            # Wait for all generation tasks to complete
+            for task_idx, result_generator in enumerate(generation_tasks):
+                beam_idx, beam_tokens, beam_logprob = beam_indices[task_idx]
+
+                try:
+                    async for result in result_generator:
+                        if result.outputs and len(result.outputs) > 0:
+                            output = result.outputs[0]
+
+                            if output.logprobs and len(output.logprobs) > 0:
+                                # Extract top candidates from logprobs
+                                logprobs_dict = output.logprobs[0]
+
+                                total_candidates = len(logprobs_dict)
+                                filtered_candidates = 0
+
+                                for token_id, logprob_data in (
+                                        logprobs_dict.items()):
+                                    # Skip tokens with very low probability
+                                    if logprob_data.logprob < logprob_threshold:
+                                        continue
+
+                                    filtered_candidates += 1
+                                    new_beam_tokens = beam_tokens + [token_id]
+                                    new_beam_logprob = (beam_logprob +
+                                                        logprob_data.logprob)
+
+                                    is_beam_finished = False
+
+                                    # Check if this is an EOS token
+                                    if (eos_token_id is not None
+                                            and token_id == eos_token_id):
+                                        is_beam_finished = True
+
+                                    # Check other finish conditions
+                                    if (output.finish_reason is not None and
+                                            output.finish_reason != "length"):
+                                        is_beam_finished = True
+                                    if len(new_beam_tokens) >= max_beam_tokens:
+                                        is_beam_finished = True
+
+                                    new_beams.append(
+                                        (new_beam_tokens, new_beam_logprob,
+                                         is_beam_finished))
+
+                                print(f"Beam {beam_idx}: filtered "
+                                      f"{filtered_candidates}/"
+                                      f"{total_candidates} "
+                                      f"candidates")
+                        break
+                except Exception as e:
+                    print(
+                        f"Error generating token for beam {beam_tokens}: {e}")
+                    new_beams.append((beam_tokens, beam_logprob, True))
+                    continue
+        except Exception as e:
+            print(f"Error in parallel generation: {e}")
+            # Fallback: mark all remaining beams as finished
+            for beam_idx, beam_tokens, beam_logprob in beam_indices:
+                new_beams.append((beam_tokens, beam_logprob, True))
+
+    def _create_beam_result_generators(
+            self, beam_results: list, prompts: list[PromptType],
+            request_id: str,
+            tokenizer) -> list[AsyncGenerator[RequestOutput, None]]:
+        """Create async generators for beam search results."""
+        list_result_generator = []
+
+        for prompt_idx, (best_tokens, best_logprob,
+                         _) in enumerate(beam_results):
+            # Use default arguments to capture values by value, not reference
+            async def create_beam_result(tokens=best_tokens,
+                                         logprob=best_logprob,
+                                         idx=prompt_idx):
+                if tokens:
+                    # Decode the best tokens using the pre-fetched tokenizer
+                    try:
+                        if tokenizer is not None:
+                            generated_text = tokenizer.decode(
+                                tokens, skip_special_tokens=True)
+                        else:
+                            # Fallback: get tokenizer if not available
+                            from vllm.transformers_utils.tokenizer import (
+                                get_tokenizer)
+                            fallback_tokenizer = get_tokenizer(
+                                tokenizer_name=self.model_config.tokenizer,
+                                tokenizer_mode=self.model_config.
+                                tokenizer_mode,
+                                trust_remote_code=(
+                                    self.model_config.trust_remote_code),
+                                revision=self.model_config.tokenizer_revision)
+                            generated_text = fallback_tokenizer.decode(
+                                tokens, skip_special_tokens=True)
+                    except Exception as e:
+                        logger.warning("Failed to decode tokens %s: %s",
+                                       tokens, e)
+                        # Fallback: convert tokens to string representation
+                        generated_text = " ".join(
+                            str(token) for token in tokens)
+                else:
+                    generated_text = ""
+
+                completion_output = CompletionOutput(
+                    index=0,
+                    text=generated_text,
+                    token_ids=tokens,
+                    cumulative_logprob=logprob,
+                    logprobs=None,  # Could include detailed logprobs if needed
+                    finish_reason="stop" if tokens else "length")
+
+                request_output = RequestOutput(
+                    request_id=f"{request_id}-beam-{idx}",
+                    prompt=prompts[idx],
+                    prompt_token_ids=[],  # Would need proper tokenization
+                    prompt_logprobs=None,
+                    outputs=[completion_output],
+                    finished=True)
+
+                yield request_output
+
+            list_result_generator.append(create_beam_result())
+
+        return list_result_generator
