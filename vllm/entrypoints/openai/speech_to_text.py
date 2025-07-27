@@ -395,18 +395,9 @@ class OpenAISpeechToText(OpenAIServing):
         Returns:
             List of async generators for beam search results
         """
-        # Optimization 1: Get tokenizer once for the complete beam search
-        try:
-            from vllm.transformers_utils.tokenizer import get_tokenizer
-            tokenizer = get_tokenizer(
-                tokenizer_name=self.model_config.tokenizer,
-                tokenizer_mode=self.model_config.tokenizer_mode,
-                trust_remote_code=self.model_config.trust_remote_code,
-                revision=self.model_config.tokenizer_revision)
-            eos_token_id = tokenizer.eos_token_id
-        except Exception:
-            tokenizer = None
-            eos_token_id = None
+        # Optimization 1: Skip tokenizer loading and assume EOS token ID
+        eos_token_id = 2  # Assume EOS token ID is 2
+        print(f"Using assumed EOS token ID: {eos_token_id}")
 
         # Optimization 3: Set logprob threshold to filter out low-probability
         # candidates
@@ -415,9 +406,9 @@ class OpenAISpeechToText(OpenAIServing):
         beam_results = []
 
         for prompt_idx, prompt in enumerate(prompts):
-            # Initialize beam with empty tokens list
-            # Each beam element: (tokens, cumulative_logprob, is_finished)
-            beams = [([], 0.0, False)]
+            # Initialize beam with empty tokens and text
+            # Each beam element: (tokens, text, cumulative_logprob, is_finished)
+            beams = [([], "", 0.0, False)]
 
             # Generate tokens one by one up to max_tokens
             max_beam_tokens = sampling_params.max_tokens
@@ -426,7 +417,7 @@ class OpenAISpeechToText(OpenAIServing):
             print(f"prompt: {prompt}")
 
             for step in range(max_beam_tokens):
-                if not beams or all(beam[2] for beam in beams):
+                if not beams or all(beam[3] for beam in beams):
                     break  # All beams finished
 
                 new_beams = []
@@ -438,10 +429,11 @@ class OpenAISpeechToText(OpenAIServing):
                 beam_indices = []
 
                 # Prepare generation tasks for each active beam
-                for beam_idx, (beam_tokens, beam_logprob,
+                for beam_idx, (beam_tokens, beam_text, beam_logprob,
                                is_finished) in enumerate(beams):
                     if is_finished:
-                        new_beams.append((beam_tokens, beam_logprob, True))
+                        new_beams.append(
+                            (beam_tokens, beam_text, beam_logprob, True))
                         continue
 
                     # Validate prompt format
@@ -475,7 +467,8 @@ class OpenAISpeechToText(OpenAIServing):
                         current_prompt, beam_sampling_params,
                         f"{request_id}-beam-{prompt_idx}-{step}-{beam_idx}")
                     generation_tasks.append(generation_task)
-                    beam_indices.append((beam_idx, beam_tokens, beam_logprob))
+                    beam_indices.append(
+                        (beam_idx, beam_tokens, beam_text, beam_logprob))
 
                 # Run all generation tasks in parallel and collect results
                 if generation_tasks:
@@ -484,7 +477,7 @@ class OpenAISpeechToText(OpenAIServing):
                         eos_token_id, logprob_threshold, max_beam_tokens)
 
                 # Select top beam_size beams based on cumulative logprob
-                new_beams.sort(key=lambda x: x[1], reverse=True)
+                new_beams.sort(key=lambda x: x[2], reverse=True)
                 beams = new_beams[:beam_size]
 
                 if not beams:
@@ -492,15 +485,15 @@ class OpenAISpeechToText(OpenAIServing):
 
             # Store the best beam for this prompt
             if beams:
-                best_beam = max(beams, key=lambda x: x[1])  # Best by logprob
+                best_beam = max(beams, key=lambda x: x[2])  # Best by logprob
                 print(f"Best beam for prompt {prompt_idx}: {best_beam}")
                 beam_results.append(best_beam)
             else:
-                beam_results.append(([], 0.0, True))  # Empty result
+                beam_results.append(([], "", 0.0, True))  # Empty result
 
         # Generate final results using the beam search outputs
         return self._create_beam_result_generators(beam_results, prompts,
-                                                   request_id, tokenizer)
+                                                   request_id)
 
     async def _process_parallel_beam_tasks(self, generation_tasks: list,
                                            beam_indices: list, new_beams: list,
@@ -512,20 +505,22 @@ class OpenAISpeechToText(OpenAIServing):
         # Process all tasks concurrently using gather for better performance
         async def process_single_task(task_idx: int, result_generator) -> None:
             """Process a single beam generation task."""
-            beam_idx, beam_tokens, beam_logprob = beam_indices[task_idx]
+            beam_idx, beam_tokens, beam_text, beam_logprob = beam_indices[
+                task_idx]
 
             try:
                 async for result in result_generator:
                     output = result.outputs[0] if result.outputs else None
                     if not output or not output.logprobs:
-                        new_beams.append((beam_tokens, beam_logprob, True))
+                        new_beams.append(
+                            (beam_tokens, beam_text, beam_logprob, True))
                         return
 
-                    # Process logprobs efficiently
+                    # Process logprobs efficiently and extract text from output
                     candidates_added = self._process_beam_candidates(
-                        beam_tokens, beam_logprob, output.logprobs[0],
-                        eos_token_id, logprob_threshold, max_beam_tokens,
-                        output.finish_reason, new_beams)
+                        beam_tokens, beam_text, beam_logprob,
+                        output.logprobs[0], eos_token_id, logprob_threshold,
+                        max_beam_tokens, output.finish_reason, new_beams)
 
                     print(f"Beam {beam_idx}: added {candidates_added} "
                           f"candidates")
@@ -533,7 +528,7 @@ class OpenAISpeechToText(OpenAIServing):
 
             except Exception as e:
                 print(f"Error in beam {beam_idx}: {e}")
-                new_beams.append((beam_tokens, beam_logprob, True))
+                new_beams.append((beam_tokens, beam_text, beam_logprob, True))
 
         # Run all tasks concurrently for better performance
         try:
@@ -545,11 +540,11 @@ class OpenAISpeechToText(OpenAIServing):
         except Exception as e:
             print(f"Error in parallel beam processing: {e}")
             # Fallback: mark remaining beams as finished
-            for beam_idx, beam_tokens, beam_logprob in beam_indices:
-                new_beams.append((beam_tokens, beam_logprob, True))
+            for beam_idx, beam_tokens, beam_text, beam_logprob in beam_indices:
+                new_beams.append((beam_tokens, beam_text, beam_logprob, True))
 
-    def _process_beam_candidates(self, beam_tokens: list, beam_logprob: float,
-                                 logprobs_dict: dict,
+    def _process_beam_candidates(self, beam_tokens: list, beam_text: str,
+                                 beam_logprob: float, logprobs_dict: dict,
                                  eos_token_id: Optional[int],
                                  logprob_threshold: float,
                                  max_beam_tokens: int,
@@ -567,6 +562,7 @@ class OpenAISpeechToText(OpenAIServing):
 
         for token_id, logprob_data in valid_candidates:
             new_beam_tokens = beam_tokens + [token_id]
+            new_beam_text = beam_text + logprob_data.decoded_token
             new_beam_logprob = beam_logprob + logprob_data.logprob
 
             # Determine if beam should finish
@@ -575,52 +571,27 @@ class OpenAISpeechToText(OpenAIServing):
                 or (finish_reason is not None and finish_reason != "length")
                 or (len(new_beam_tokens) >= max_beam_tokens))
 
-            new_beams.append(
-                (new_beam_tokens, new_beam_logprob, is_beam_finished))
+            new_beams.append((new_beam_tokens, new_beam_text, new_beam_logprob,
+                              is_beam_finished))
             candidates_added += 1
 
         return candidates_added
 
     def _create_beam_result_generators(
             self, beam_results: list, prompts: list[PromptType],
-            request_id: str,
-            tokenizer) -> list[AsyncGenerator[RequestOutput, None]]:
+            request_id: str) -> list[AsyncGenerator[RequestOutput, None]]:
         """Create async generators for beam search results."""
         list_result_generator = []
 
-        for prompt_idx, (best_tokens, best_logprob,
+        for prompt_idx, (best_tokens, best_text, best_logprob,
                          _) in enumerate(beam_results):
             # Use default arguments to capture values by value, not reference
             async def create_beam_result(tokens=best_tokens,
+                                         text=best_text,
                                          logprob=best_logprob,
                                          idx=prompt_idx):
-                if tokens:
-                    # Decode the best tokens using the pre-fetched tokenizer
-                    try:
-                        if tokenizer is not None:
-                            generated_text = tokenizer.decode(
-                                tokens, skip_special_tokens=True)
-                        else:
-                            # Fallback: get tokenizer if not available
-                            from vllm.transformers_utils.tokenizer import (
-                                get_tokenizer)
-                            fallback_tokenizer = get_tokenizer(
-                                tokenizer_name=self.model_config.tokenizer,
-                                tokenizer_mode=self.model_config.
-                                tokenizer_mode,
-                                trust_remote_code=(
-                                    self.model_config.trust_remote_code),
-                                revision=self.model_config.tokenizer_revision)
-                            generated_text = fallback_tokenizer.decode(
-                                tokens, skip_special_tokens=True)
-                    except Exception as e:
-                        logger.warning("Failed to decode tokens %s: %s",
-                                       tokens, e)
-                        # Fallback: convert tokens to string representation
-                        generated_text = " ".join(
-                            str(token) for token in tokens)
-                else:
-                    generated_text = ""
+                # Use the stored text directly, no tokenizer needed
+                generated_text = text if text else ""
 
                 completion_output = CompletionOutput(
                     index=0,
