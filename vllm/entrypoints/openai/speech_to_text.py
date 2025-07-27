@@ -401,7 +401,7 @@ class OpenAISpeechToText(OpenAIServing):
 
         # Optimization 3: Set logprob threshold to filter out low-probability
         # candidates
-        logprob_threshold = -10.0
+        logprob_threshold = -5.0  # around 1%
 
         beam_results = []
 
@@ -559,6 +559,11 @@ class OpenAISpeechToText(OpenAIServing):
             for token_id, logprob_data in logprobs_dict.items()
             if logprob_data.logprob >= logprob_threshold
         ]
+
+        if not valid_candidates:
+            # No valid candidates, mark beam as finished
+            new_beams.append((beam_tokens, beam_text, beam_logprob, True))
+            return 0
 
         for token_id, logprob_data in valid_candidates:
             new_beam_tokens = beam_tokens + [token_id]
