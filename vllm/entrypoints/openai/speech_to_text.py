@@ -460,6 +460,7 @@ class OpenAISpeechToText(OpenAIServing):
                         top_k=beam_size * 2,  # Get more candidates
                         logprobs=beam_size * 2,  # Get logprobs for candidates
                         n=1,
+                        repetition_penalty=sampling_params.repetition_penalty,
                     )
 
                     # Create generation task
