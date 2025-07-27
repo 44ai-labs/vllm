@@ -399,7 +399,10 @@ async def test_beam_search_timing(mary_had_lamb, model_name):
                 language="en",
                 response_format="text",
                 temperature=0.0,
-                extra_body={"use_beam_search": False})
+                extra_body={
+                    "use_beam_search": False,
+                    "max_tokens": 300
+                })
             end_time = time.time()
             regular_times.append(end_time - start_time)
             print(f"Regular transcription run {i+1}: {regular_times[-1]:.2f}s")
@@ -417,7 +420,8 @@ async def test_beam_search_timing(mary_had_lamb, model_name):
                 temperature=0.0,
                 extra_body={
                     "use_beam_search": True,
-                    "beam_size": 5
+                    "beam_size": 5,
+                    "max_tokens": 300
                 })
             end_time = time.time()
             beam_times.append(end_time - start_time)

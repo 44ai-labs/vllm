@@ -2111,6 +2111,16 @@ class TranscriptionRequest(OpenAIBaseModel):
 
     presence_penalty: Optional[float] = 0.0
     """The presence penalty to use for sampling."""
+
+    # Beam search parameters
+    use_beam_search: Optional[bool] = False
+    """Whether to use beam search for generation."""
+
+    beam_size: int = 5
+    """Number of beams."""
+
+    max_tokens: Optional[int] = None
+    """The maximum number of tokens to generate in the transcription."""
     # --8<-- [end:transcription-sampling-params]
 
     # Default sampling parameters for transcription requests.
@@ -2127,7 +2137,9 @@ class TranscriptionRequest(OpenAIBaseModel):
             default_max_tokens: int,
             default_sampling_params: Optional[dict] = None) -> SamplingParams:
 
-        max_tokens = default_max_tokens
+        # Use provided max_tokens or fall back to default
+        max_tokens = self.max_tokens if \
+            self.max_tokens is not None else default_max_tokens
 
         if default_sampling_params is None:
             default_sampling_params = {}
@@ -2346,6 +2358,9 @@ class TranslationRequest(OpenAIBaseModel):
     # Flattened stream option to simplify form data.
     stream_include_usage: Optional[bool] = False
     stream_continuous_usage_stats: Optional[bool] = False
+
+    max_tokens: Optional[int] = None
+    """The maximum number of tokens to generate in the translation."""
     # --8<-- [end:translation-extra-params]
 
     # Default sampling parameters for translation requests.
@@ -2358,7 +2373,9 @@ class TranslationRequest(OpenAIBaseModel):
             default_max_tokens: int,
             default_sampling_params: Optional[dict] = None) -> SamplingParams:
 
-        max_tokens = default_max_tokens
+        # Use provided max_tokens or fall back to default
+        max_tokens = self.max_tokens if \
+            self.max_tokens is not None else default_max_tokens
 
         if default_sampling_params is None:
             default_sampling_params = {}
