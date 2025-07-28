@@ -2073,6 +2073,16 @@ class TranscriptionRequest(OpenAIBaseModel):
 
     presence_penalty: Optional[float] = 0.0
     """The presence penalty to use for sampling."""
+
+    # Beam search parameters
+    use_beam_search: Optional[bool] = False
+    """Whether to use beam search for generation."""
+
+    beam_size: int = 5
+    """Number of beams."""
+
+    max_tokens: Optional[int] = None
+    """The maximum number of tokens to generate in the transcription."""
     # --8<-- [end:transcription-sampling-params]
 
     # Default sampling parameters for transcription requests.
@@ -2089,7 +2099,9 @@ class TranscriptionRequest(OpenAIBaseModel):
             default_max_tokens: int,
             default_sampling_params: Optional[dict] = None) -> SamplingParams:
 
-        max_tokens = default_max_tokens
+        # Use provided max_tokens or fall back to default
+        max_tokens = self.max_tokens if \
+            self.max_tokens is not None else default_max_tokens
 
         if default_sampling_params is None:
             default_sampling_params = {}
@@ -2122,6 +2134,8 @@ class TranscriptionRequest(OpenAIBaseModel):
                                             frequency_penalty=self.frequency_penalty,
                                             repetition_penalty=repetition_penalty,
                                             presence_penalty=self.presence_penalty,
+                                            use_beam_search=self.use_beam_search,
+                                            beam_size=self.beam_size,
                                             output_kind=RequestOutputKind.DELTA
                                             if self.stream \
                                             else RequestOutputKind.FINAL_ONLY,
@@ -2141,6 +2155,21 @@ class TranscriptionRequest(OpenAIBaseModel):
         if any(bool(data.get(so, False)) for so in stream_opts) and not stream:
             raise ValueError(
                 "Stream options can only be defined when `stream=True`.")
+
+        # Validate beam search + streaming combination
+        use_beam_search = data.get("use_beam_search", False)
+        if use_beam_search and stream:
+            raise ValueError(
+                "Streaming is not supported when beam search is enabled. "
+                "Please set either `use_beam_search=False` or `stream=False`.")
+
+        # Validate beam search + V0 engine combination
+        if use_beam_search and not envs.VLLM_USE_V1:
+            raise ValueError(
+                "Beam search is not supported in vLLM engine V0 due to lack of "
+                "cache prefix support for encoder-decoder models. "
+                "Please set VLLM_USE_V1=1 to use the V1 engine, or set "
+                "`use_beam_search=False` to disable beam search.")
 
         return data
 
@@ -2293,6 +2322,9 @@ class TranslationRequest(OpenAIBaseModel):
     # Flattened stream option to simplify form data.
     stream_include_usage: Optional[bool] = False
     stream_continuous_usage_stats: Optional[bool] = False
+
+    max_tokens: Optional[int] = None
+    """The maximum number of tokens to generate in the translation."""
     # --8<-- [end:translation-extra-params]
 
     # Default sampling parameters for translation requests.
@@ -2305,7 +2337,9 @@ class TranslationRequest(OpenAIBaseModel):
             default_max_tokens: int,
             default_sampling_params: Optional[dict] = None) -> SamplingParams:
 
-        max_tokens = default_max_tokens
+        # Use provided max_tokens or fall back to default
+        max_tokens = self.max_tokens if \
+            self.max_tokens is not None else default_max_tokens
 
         if default_sampling_params is None:
             default_sampling_params = {}
