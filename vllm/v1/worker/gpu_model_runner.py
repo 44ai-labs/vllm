@@ -151,13 +151,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.mm_registry = MULTIMODAL_REGISTRY
         self.uses_mrope = model_config.uses_mrope
 
-        encoder_compute_budget, encoder_cache_size = compute_encoder_budget(
-            model_config=model_config,
-            scheduler_config=scheduler_config,
-            mm_registry=self.mm_registry,
-        )
-        self.max_num_encoder_input_tokens = encoder_compute_budget
-        self.encoder_cache_size = encoder_cache_size
         # Maximum length of the encoder input, only for encoder-decoder models.
         self.max_encoder_len = self.mm_registry.\
             get_encdec_max_encoder_len(model_config)
@@ -2539,7 +2532,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     def profile_run(self) -> None:
         # Profile with multimodal encoder & encoder cache.
-        if self.is_multimodal_model and not self.model_config.is_encoder_decoder:
+        if (self.is_multimodal_model
+                and not self.model_config.is_encoder_decoder):
             mm_budget = self.mm_budget
             assert mm_budget is not None
 
