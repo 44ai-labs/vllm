@@ -380,6 +380,242 @@ class OpenAISpeechToText(OpenAIServing):
                 min_energy = energy
         return quietest_idx
 
+    def _calculate_uncertainty_from_top_logprobs(
+            self, token_logprobs: list) -> float:
+        """Calculate uncertainty score from top 5 logprobs.
+        
+        Uses multiple metrics to assess uncertainty:
+        1. Entropy of the top logprobs distribution
+        2. Gap between top and second-best token
+        3. Spread of probabilities among top tokens
+        
+        Args:
+            token_logprobs: List of (token_id, logprob_data) tuples
+            
+        Returns:
+            Uncertainty score (lower = more certain, higher = more uncertain)
+        """
+        if not token_logprobs:
+            return -10.0  # Very uncertain if no logprobs
+
+        # Extract logprobs and convert to probabilities
+        logprobs = [data.logprob for _, data in token_logprobs]
+
+        # Ensure we have at least one logprob
+        if not logprobs:
+            return -10.0
+
+        # Convert to probabilities for analysis
+        import math
+        probs = [math.exp(lp) for lp in logprobs]
+
+        # Normalize probabilities (they should already be normalized but ensure)
+        total_prob = sum(probs)
+        if total_prob > 0:
+            probs = [p / total_prob for p in probs]
+
+        # Metric 1: Entropy - measures overall uncertainty
+        entropy = 0.0
+        for p in probs:
+            if p > 1e-10:  # Avoid log(0)
+                entropy -= p * math.log2(p)
+
+        # Metric 2: Gap between top two tokens
+        top_gap = 0.0
+        if len(probs) >= 2:
+            top_gap = probs[0] - probs[1]
+
+        # Metric 3: Concentration ratio - how much probability is in top token
+        concentration = probs[0] if probs else 0.0
+
+        # Combined uncertainty score
+        # Higher entropy = more uncertain
+        # Lower top gap = more uncertain
+        # Lower concentration = more uncertain
+
+        # Normalize entropy (max for 5 tokens is log2(5) ≈ 2.32)
+        normalized_entropy = entropy / 2.32 if len(probs) > 1 else 0.0
+
+        # Adjusted composite uncertainty score to keep within -5 to 0 range
+        # Start from maximum uncertainty (-5) and add certainty factors
+        uncertainty_score = -5.0  # Start at maximum uncertainty
+
+        print("Uncertainty metrics: ")
+        print(f"  Entropy: {normalized_entropy:.3f}")
+        print(f"  Top gap: {top_gap:.3f}")
+        print(f"  Concentration: {concentration:.3f}")
+        # Add certainty contributions (all positive, bringing score toward 0)
+        uncertainty_score += 2.0 * (1 - normalized_entropy)
+        uncertainty_score += 2.0 * top_gap
+        uncertainty_score += 1.0 * concentration
+
+        print(f"Calculated uncertainty score: {uncertainty_score:.3f} ")
+        # Clamp to reasonable range
+        uncertainty_score = max(-5.0, min(0.0, uncertainty_score))
+
+        return uncertainty_score
+
+    def _build_step_sizes_from_segments(self,
+                                        uncertainty_scores: list) -> list[int]:
+        """Build step sizes based on uncertainty segments rather than 
+        individual tokens.
+        
+        Args:
+            uncertainty_scores: List of uncertainty scores for each token
+            
+        Returns:
+            List of step sizes for each token position
+        """
+        if not uncertainty_scores:
+            return []
+
+        # Updated thresholds for composite uncertainty scores (range -6 to 0)
+        uncertainty_thresholds = [
+            (-0.5, 6),  # Very high certainty: step size 6
+            (-1.5, 5),  # High certainty: step size 5
+            (-2.5, 4),  # Medium-high certainty: step size 4
+            (-3.5, 3),  # Medium certainty: step size 3
+            (-4.5, 2),  # Low-medium certainty: step size 2
+            (float('-inf'), 1)  # Low certainty: step size 1
+        ]
+
+        # First pass: identify segments of similar uncertainty
+        segments = []
+        current_segment = {
+            'start': 0,
+            'scores': [uncertainty_scores[0]],
+            'indices': [0]
+        }
+
+        # Group consecutive tokens with similar uncertainty levels
+        uncertainty_tolerance = 1.0  # Allow some variance within segments
+
+        for i in range(1, len(uncertainty_scores)):
+            current_avg = sum(current_segment['scores']) / len(
+                current_segment['scores'])
+            score_diff = abs(uncertainty_scores[i] - current_avg)
+
+            if score_diff <= uncertainty_tolerance:
+                # Continue current segment
+                current_segment['scores'].append(uncertainty_scores[i])
+                current_segment['indices'].append(i)
+            else:
+                # End current segment and start new one
+                current_segment['end'] = current_segment['indices'][-1]
+                current_segment['length'] = len(current_segment['indices'])
+                current_segment['avg_uncertainty'] = current_avg
+                segments.append(current_segment)
+
+                # Start new segment
+                current_segment = {
+                    'start': i,
+                    'scores': [uncertainty_scores[i]],
+                    'indices': [i]
+                }
+
+        # Close last segment
+        current_segment['end'] = current_segment['indices'][-1]
+        current_segment['length'] = len(current_segment['indices'])
+        current_segment['avg_uncertainty'] = sum(
+            current_segment['scores']) / len(current_segment['scores'])
+        segments.append(current_segment)
+
+        # Second pass: assign step sizes based on segment characteristics
+        step_sizes = [1] * len(
+            uncertainty_scores)  # Initialize with conservative step size
+
+        for segment in segments:
+            avg_uncertainty = segment['avg_uncertainty']
+            segment_length = segment['length']
+
+            # Determine base step size from uncertainty level
+            base_step_size = 1
+            for threshold, size in uncertainty_thresholds:
+                if avg_uncertainty >= threshold:
+                    base_step_size = size
+                    break
+
+            # Adjust step size based on segment characteristics
+            adjusted_step_size = self._adjust_step_size_for_segment(
+                base_step_size, segment_length, avg_uncertainty)
+
+            # Apply the step size to all tokens in the segment
+            for idx in segment['indices']:
+                step_sizes[idx] = adjusted_step_size
+
+        # Third pass: smooth step size transitions to avoid abrupt changes
+        smoothed_step_sizes = self._smooth_step_size_transitions(
+            step_sizes, segments)
+
+        return smoothed_step_sizes
+
+    def _adjust_step_size_for_segment(self, base_step_size: int,
+                                      segment_length: int,
+                                      avg_uncertainty: float) -> int:
+        """Adjust step size based on segment characteristics.
+        
+        Args:
+            base_step_size: Base step size from uncertainty level
+            segment_length: Length of the uncertainty segment
+            avg_uncertainty: Average uncertainty in the segment
+            
+        Returns:
+            Adjusted step size
+        """
+        adjusted_size = base_step_size
+
+        # For very short segments (1-2 tokens), be more conservative
+        if segment_length <= 2:
+            adjusted_size = min(adjusted_size, 3)
+
+        # For longer segments with consistent high certainty, allow larger steps
+        elif segment_length >= 5 and avg_uncertainty >= -1.0:
+            adjusted_size = min(adjusted_size + 1, 6)
+
+        # For very uncertain long segments, cap at smaller steps
+        elif segment_length >= 3 and avg_uncertainty <= -4.0:
+            adjusted_size = min(adjusted_size, 2)
+
+        return max(1, min(6, adjusted_size))  # Ensure within valid range
+
+    def _smooth_step_size_transitions(self, step_sizes: list,
+                                      segments: list) -> list[int]:
+        """Smooth abrupt transitions between segment step sizes.
+        
+        Args:
+            step_sizes: Raw step sizes for each token
+            segments: List of uncertainty segments
+            
+        Returns:
+            Smoothed step sizes
+        """
+        smoothed = step_sizes.copy()
+
+        # Apply transition smoothing between segments
+        for i in range(len(segments) - 1):
+            current_seg = segments[i]
+            next_seg = segments[i + 1]
+
+            current_step = step_sizes[current_seg['end']]
+            next_step = step_sizes[next_seg['start']]
+
+            # If there's a large jump, add transition tokens
+            step_diff = abs(next_step - current_step)
+            if step_diff >= 3:
+                # Create gradual transition
+                transition_length = min(3, next_seg['length'])
+                for j in range(transition_length):
+                    transition_idx = next_seg['start'] + j
+                    if transition_idx < len(smoothed):
+                        # Gradually transition from current to next step size
+                        progress = (j + 1) / transition_length
+                        interpolated_step = int(current_step + progress *
+                                                (next_step - current_step))
+                        smoothed[transition_idx] = max(
+                            1, min(6, interpolated_step))
+
+        return smoothed
+
     async def _perform_beam_search(
             self, prompts: list[PromptType], sampling_params: SamplingParams,
             request_id: str,
@@ -416,14 +652,70 @@ class OpenAISpeechToText(OpenAIServing):
                   f"with max tokens {max_beam_tokens}")
             print(f"prompt: {prompt}")
 
-            for step in range(max_beam_tokens):
+            # Step 1: Run initial transcription to get logprob uncertainties
+            initial_sampling_params = SamplingParams(
+                max_tokens=max_beam_tokens,
+                temperature=0.0,
+                logprobs=20,  # Get logprobs for uncertainty analysis
+                n=1,
+                repetition_penalty=sampling_params.repetition_penalty,
+            )
+
+            initial_request_id = f"{request_id}-initial-{prompt_idx}"
+            initial_result_generator = self.engine_client.generate(
+                prompt, initial_sampling_params, initial_request_id)
+
+            all_logprobs = []
+            uncertainty_scores = []
+            async for result in initial_result_generator:
+                for output in result.outputs:
+                    print(f"Logprob len {len(output.logprobs)} "
+                          f"for prompt {prompt_idx}")
+                    # print(f"Output for prompt {prompt_idx}: {output}")
+                    if output.logprobs:
+                        all_logprobs = output.logprobs
+                        # Extract top 5 logprobs for uncertainty analysis
+            for logprob in all_logprobs:
+                token_logprobs = list(logprob.items())
+                # Calculate uncertainty based on top 5 logprobs
+                uncertainty_score = (
+                    self._calculate_uncertainty_from_top_logprobs(
+                        token_logprobs[:5]))
+                uncertainty_scores.append(uncertainty_score)
+
+            # Step 2: Build uncertainty profile and calculate step sizes
+            # using segments
+            step_sizes = self._build_step_sizes_from_segments(
+                uncertainty_scores)
+
+            print(f"Segment-based step sizes for prompt {prompt_idx}:")
+            print(f"  Step sizes: {step_sizes}")
+            print(f"  Total tokens: {len(step_sizes)}")
+            print("  Step size distribution:")
+            for size in range(1, 7):
+                count = step_sizes.count(size)
+                percentage = ((count / len(step_sizes)) *
+                              100 if step_sizes else 0)
+                print(f"    Size {size}: {count} tokens ({percentage:.1f}%)")
+
+            # Step 3: Perform beam search using dynamic step sizes
+            current_position = 0
+            while current_position < max_beam_tokens:
                 if not beams or all(beam[3] for beam in beams):
                     break  # All beams finished
 
                 new_beams = []
-                print(f"Step {step + 1}/{max_beam_tokens} for prompt "
-                      f"{prompt_idx}, current beams: {len(beams)}")
+                print(f"Step position {current_position + 1}/"
+                      f"{max_beam_tokens} for prompt {prompt_idx}, "
+                      f"current beams: {len(beams)}")
 
+                # Determine current step size
+                if current_position < len(step_sizes):
+                    current_step_size = step_sizes[current_position]
+                else:
+                    current_step_size = 1  # Default fallback
+
+                print(f"Current step size: {current_step_size}")
                 # Optimization 2: Run beam requests in parallel
                 generation_tasks = []
                 beam_indices = []
@@ -455,10 +747,10 @@ class OpenAISpeechToText(OpenAIServing):
 
                     # Create sampling params for getting logprobs
                     beam_sampling_params = SamplingParams(
-                        max_tokens=1,  # Generate only one token
+                        max_tokens=current_step_size,  # Generate tokens
                         temperature=0.0,  # Use greedy for stability
                         top_k=beam_size * 2,  # Get more candidates
-                        logprobs=beam_size * 2,  # Get logprobs for candidates
+                        logprobs=beam_size * 2,  # Get logprobs
                         n=1,
                         repetition_penalty=sampling_params.repetition_penalty,
                     )
@@ -466,7 +758,8 @@ class OpenAISpeechToText(OpenAIServing):
                     # Create generation task
                     generation_task = self.engine_client.generate(
                         current_prompt, beam_sampling_params,
-                        f"{request_id}-beam-{prompt_idx}-{step}-{beam_idx}")
+                        f"{request_id}-beam-{prompt_idx}-{current_position}-{beam_idx}"
+                    )
                     generation_tasks.append(generation_task)
                     beam_indices.append(
                         (beam_idx, beam_tokens, beam_text, beam_logprob))
@@ -483,6 +776,9 @@ class OpenAISpeechToText(OpenAIServing):
 
                 if not beams:
                     break
+
+                # Advance position by current step size
+                current_position += current_step_size
 
             # Store the best beam for this prompt
             if beams:
