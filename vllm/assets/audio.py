@@ -10,7 +10,8 @@ import numpy.typing as npt
 
 from vllm.utils import PlaceholderModule
 
-from .base import VLLM_S3_BUCKET_URL, get_vllm_public_assets
+from .base import (VLLM_S3_BUCKET_URL, get_44ai_public_assets,
+                   get_vllm_public_assets)
 
 try:
     import librosa
@@ -20,6 +21,7 @@ except ImportError:
 ASSET_DIR = "multimodal_asset"
 
 AudioAssetName = Literal["winning_call", "mary_had_lamb"]
+Audio44aiName = Literal["30s_test_swiss_german_7kz53lbjqr.mp3"]
 
 
 @dataclass(frozen=True)
@@ -43,3 +45,24 @@ class AudioAsset:
     @property
     def url(self) -> str:
         return urljoin(VLLM_S3_BUCKET_URL, f"{ASSET_DIR}/{self.name}.ogg")
+
+
+@dataclass(frozen=True)
+class AudioAssets44ai:
+    name: Audio44aiName
+
+    @property
+    def filename(self) -> str:
+        return f"{self.name}"
+
+    @property
+    def audio_and_sample_rate(self) -> tuple[npt.NDArray, float]:
+        audio_path = get_44ai_public_assets(filename=self.filename)
+        return librosa.load(audio_path, sr=None)
+
+    def get_local_path(self) -> Path:
+        return get_44ai_public_assets(filename=self.filename)
+
+    @property
+    def url(self) -> str:
+        return urljoin(VLLM_S3_BUCKET_URL, f"{self.name}")

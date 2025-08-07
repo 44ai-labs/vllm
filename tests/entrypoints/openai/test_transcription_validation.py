@@ -14,7 +14,7 @@ import pytest
 import soundfile as sf
 from openai._base_client import AsyncAPIClient
 
-from vllm.assets.audio import AudioAsset
+from vllm.assets.audio import AudioAsset, AudioAssets44ai
 
 from ...utils import RemoteOpenAIServer
 
@@ -34,6 +34,14 @@ def mary_had_lamb():
 @pytest.fixture
 def winning_call():
     path = AudioAsset('winning_call').get_local_path()
+    with open(str(path), "rb") as f:
+        yield f
+
+
+@pytest.fixture
+def audio_44ai():
+    path = AudioAssets44ai(
+        '30s_test_swiss_german_7kz53lbjqr.mp3').get_local_path()
     with open(str(path), "rb") as f:
         yield f
 
@@ -63,7 +71,7 @@ async def test_basic_audio(mary_had_lamb, model_name):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", ["mistralai/Voxtral-Mini-3B-2507"])
-async def test_beam_search_transcription(mary_had_lamb, model_name):
+async def test_beam_search_transcription(audio_44ai, model_name):
     """Test beam search functionality for transcription."""
     server_args = ["--enforce-eager"]
 
@@ -75,8 +83,8 @@ async def test_beam_search_transcription(mary_had_lamb, model_name):
 
         transcription_regular = await client.audio.transcriptions.create(
             model=model_name,
-            file=mary_had_lamb,
-            language="en",
+            file=audio_44ai,
+            language="de",
             response_format="text",
             temperature=0.0,
             extra_body={"use_beam_search": False})
@@ -88,11 +96,11 @@ async def test_beam_search_transcription(mary_had_lamb, model_name):
         print("Step sizes (regular):", step_sizes_regular)
 
         # Test with beam search enabled
-        mary_had_lamb.seek(0)  # Reset file pointer
+        audio_44ai.seek(0)  # Reset file pointer
         transcription_beam = await client.audio.transcriptions.create(
             model=model_name,
-            file=mary_had_lamb,
-            language="en",
+            file=audio_44ai,
+            language="de",
             response_format="text",
             temperature=0.0,
             extra_body={
@@ -107,8 +115,8 @@ async def test_beam_search_transcription(mary_had_lamb, model_name):
         # Test without beam search for comparison
 
         # Both should contain the expected text
-        assert "Mary had a little lamb," in out_beam
-        assert "Mary had a little lamb," in out_regular
+        assert "habe ich das Gefühl" in out_beam
+        assert "habe ich das Gefühl" in out_regular
 
         print(f"Regular transcription: {out_regular}")
         print(f"Beam search transcription: {out_beam}")
