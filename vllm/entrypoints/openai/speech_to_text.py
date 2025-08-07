@@ -188,8 +188,6 @@ class OpenAISpeechToText(OpenAIServing):
                 # TODO: check if prefix caching is enabled, and give
                 # warning when not
                 # "fake" beam search only works with prefix caching enabled
-
-                print("Request step sizes: ", request.step_sizes, request)
                 # Perform beam search with the new method
                 list_result_generator = await self._perform_beam_search(
                     prompts,
@@ -225,6 +223,7 @@ class OpenAISpeechToText(OpenAIServing):
             text = ""
             uncertainty_scores = []
             step_sizes = []
+            tokens = []
             for result_generator in list_result_generator:
                 all_logprobs = []
                 async for op in result_generator:
@@ -238,21 +237,12 @@ class OpenAISpeechToText(OpenAIServing):
                         self._calculate_uncertainty_from_top_logprobs(
                             token_logprobs[:5]))
                     uncertainty_scores.append(uncertainty_score)
+                    tokens.append(token_logprobs[0][1].decoded_token)
 
                 # Step 2: Build uncertainty profile and calculate step sizes
                 # using segments
                 step_sizes = self._build_step_sizes_from_segments(
-                    uncertainty_scores)
-
-                print(f"  Step sizes: {step_sizes}")
-                print(f"  Total tokens: {len(step_sizes)}")
-                print("  Step size distribution:")
-                for size in range(1, 7):
-                    count = step_sizes.count(size)
-                    percentage = ((count / len(step_sizes)) *
-                                  100 if step_sizes else 0)
-                    print(f"    Size {size}: {count} tokens "
-                          f"({percentage:.1f}%)")
+                    uncertainty_scores, tokens)
 
             return cast(
                 T,
@@ -498,8 +488,8 @@ class OpenAISpeechToText(OpenAIServing):
 
         return uncertainty_score
 
-    def _build_step_sizes_from_segments(self,
-                                        uncertainty_scores: list) -> list[int]:
+    def _build_step_sizes_from_segments(self, uncertainty_scores: list,
+                                        tokens: list[str]) -> list[int]:
         """Build step sizes based on uncertainty segments rather than 
         individual tokens.
         
@@ -512,48 +502,41 @@ class OpenAISpeechToText(OpenAIServing):
         if not uncertainty_scores:
             return []
 
-        # Updated thresholds for composite uncertainty scores (range -6 to 0)
-        uncertainty_thresholds = [
-            (-0.5, 6),  # Very high certainty: step size 6
-            (-1.5, 5),  # High certainty: step size 5
-            (-2.5, 4),  # Medium-high certainty: step size 4
-            (-3.5, 3),  # Medium certainty: step size 3
-            (-4.5, 2),  # Low-medium certainty: step size 2
-            (float('-inf'), 1)  # Low certainty: step size 1
-        ]
+        # Simple uncertainty threshold - anything below this is uncertain
+        uncertainty_threshold = -2.0  # Uncertain if score < -2.0
 
         # First pass: identify segments of similar uncertainty
         segments = []
         current_segment = {
             'start': 0,
             'scores': [uncertainty_scores[0]],
-            'indices': [0]
+            'indices': [0],
+            'is_uncertain': uncertainty_scores[0] < uncertainty_threshold
         }
 
         # Group consecutive tokens with similar uncertainty levels
-        uncertainty_tolerance = 1.0  # Allow some variance within segments
-
         for i in range(1, len(uncertainty_scores)):
-            current_avg = sum(current_segment['scores']) / len(
-                current_segment['scores'])
-            score_diff = abs(uncertainty_scores[i] - current_avg)
+            is_current_uncertain = uncertainty_scores[
+                i] < uncertainty_threshold
 
-            if score_diff <= uncertainty_tolerance:
-                # Continue current segment
+            # Continue segment if uncertainty level is the same
+            if is_current_uncertain == current_segment['is_uncertain']:
                 current_segment['scores'].append(uncertainty_scores[i])
                 current_segment['indices'].append(i)
             else:
                 # End current segment and start new one
                 current_segment['end'] = current_segment['indices'][-1]
                 current_segment['length'] = len(current_segment['indices'])
-                current_segment['avg_uncertainty'] = current_avg
+                current_segment['avg_uncertainty'] = sum(
+                    current_segment['scores']) / len(current_segment['scores'])
                 segments.append(current_segment)
 
                 # Start new segment
                 current_segment = {
                     'start': i,
                     'scores': [uncertainty_scores[i]],
-                    'indices': [i]
+                    'indices': [i],
+                    'is_uncertain': is_current_uncertain
                 }
 
         # Close last segment
@@ -568,96 +551,235 @@ class OpenAISpeechToText(OpenAIServing):
             uncertainty_scores)  # Initialize with conservative step size
 
         for segment in segments:
-            avg_uncertainty = segment['avg_uncertainty']
-            segment_length = segment['length']
-
-            # Determine base step size from uncertainty level
-            base_step_size = 1
-            for threshold, size in uncertainty_thresholds:
-                if avg_uncertainty >= threshold:
-                    base_step_size = size
-                    break
-
-            # Adjust step size based on segment characteristics
-            adjusted_step_size = self._adjust_step_size_for_segment(
-                base_step_size, segment_length, avg_uncertainty)
+            # Uncertain regions: always step size 1
+            step_size = 1 if segment['is_uncertain'] else segment['length']
 
             # Apply the step size to all tokens in the segment
             for idx in segment['indices']:
-                step_sizes[idx] = adjusted_step_size
+                step_sizes[idx] = step_size
 
-        # Third pass: smooth step size transitions to avoid abrupt changes
-        smoothed_step_sizes = self._smooth_step_size_transitions(
-            step_sizes, segments)
+        # Create safe step sizes that respect high-uncertainty areas
+        safe_step_sizes = self._create_safe_step_sizes(step_sizes)
 
-        return smoothed_step_sizes
+        # Print uncertainty curve and step sizes for visualization
+        self._print_uncertainty_curve_and_step_sizes(segments, step_sizes,
+                                                     safe_step_sizes, tokens)
 
-    def _adjust_step_size_for_segment(self, base_step_size: int,
-                                      segment_length: int,
-                                      avg_uncertainty: float) -> int:
-        """Adjust step size based on segment characteristics.
+        return safe_step_sizes
+
+    def _create_safe_step_sizes(self, step_sizes: list[int]) -> list[int]:
+        """Create safe step sizes that respect high-uncertainty areas.
+        
+        For each position, the safe step size is the minimum of:
+        1. The suggested step size at that position
+        2. The minimum step size in the potential lookahead window
+        
+        This ensures we never jump over areas marked as high-uncertainty 
+        (step size 1).
+        """
+        if not step_sizes:
+            return []
+
+        safe_step_sizes = []
+
+        for i in range(len(step_sizes)):
+            suggested_step = step_sizes[i]
+
+            # Look ahead in the window we could potentially step through
+            lookahead_end = min(i + suggested_step, len(step_sizes))
+            window_step_sizes = step_sizes[i:lookahead_end]
+
+            # If any position in our potential step has high uncertainty
+            # (step size 1),
+            # we must use step size 1 to not skip over it
+            min_step_in_window = min(
+                window_step_sizes) if window_step_sizes else 1
+
+            # The safe step size is the minimum of what we want and what's safe
+            safe_step_size = min(suggested_step, min_step_in_window)
+            safe_step_sizes.append(safe_step_size)
+
+        return safe_step_sizes
+
+    def _create_usage_pattern(self, step_sizes: list[int]) -> str:
+        """Create a string showing how the step sizes will 
+        actually be used during beam search.
         
         Args:
-            base_step_size: Base step size from uncertainty level
-            segment_length: Length of the uncertainty segment
-            avg_uncertainty: Average uncertainty in the segment
+            step_sizes: List of step sizes for each position
             
         Returns:
-            Adjusted step size
+            String showing the actual usage pattern (e.g., "6xxxxx111116xxxxx")
         """
-        adjusted_size = base_step_size
+        if not step_sizes:
+            return ""
 
-        # For very short segments (1-2 tokens), be more conservative
-        if segment_length <= 2:
-            adjusted_size = min(adjusted_size, 3)
+        usage_pattern = []
+        position = 0
 
-        # For longer segments with consistent high certainty, allow larger steps
-        elif segment_length >= 5 and avg_uncertainty >= -1.0:
-            adjusted_size = min(adjusted_size + 1, 6)
+        while position < len(step_sizes):
+            current_step = step_sizes[position]
 
-        # For very uncertain long segments, cap at smaller steps
-        elif segment_length >= 3 and avg_uncertainty <= -4.0:
-            adjusted_size = min(adjusted_size, 2)
+            # Add the step size digit
+            usage_pattern.append(str(current_step))
 
-        return max(1, min(6, adjusted_size))  # Ensure within valid range
+            # Add 'x' for the positions that will be skipped
+            for _ in range(1, current_step):
+                if position + _ < len(step_sizes):
+                    usage_pattern.append('x')
 
-    def _smooth_step_size_transitions(self, step_sizes: list,
-                                      segments: list) -> list[int]:
-        """Smooth abrupt transitions between segment step sizes.
-        
-        Args:
-            step_sizes: Raw step sizes for each token
-            segments: List of uncertainty segments
-            
-        Returns:
-            Smoothed step sizes
-        """
-        smoothed = step_sizes.copy()
+            # Move to next position
+            position += current_step
 
-        # Apply transition smoothing between segments
-        for i in range(len(segments) - 1):
-            current_seg = segments[i]
-            next_seg = segments[i + 1]
+        return ''.join(usage_pattern)
 
-            current_step = step_sizes[current_seg['end']]
-            next_step = step_sizes[next_seg['start']]
+    def _print_uncertainty_curve_and_step_sizes(self, segments: list,
+                                                smoothed_step_sizes: list[int],
+                                                safe_step_sizes: list[int],
+                                                tokens: list[str]) -> None:
+        """Print compact visualization of uncertainty curve and step 
+        sizes with text alignment."""
+        print("\n" + "=" * 80)
+        print("UNCERTAINTY & STEP SIZE ANALYSIS")
+        print("=" * 80)
 
-            # If there's a large jump, add transition tokens
-            step_diff = abs(next_step - current_step)
-            if step_diff >= 3:
-                # Create gradual transition
-                transition_length = min(3, next_seg['length'])
-                for j in range(transition_length):
-                    transition_idx = next_seg['start'] + j
-                    if transition_idx < len(smoothed):
-                        # Gradually transition from current to next step size
-                        progress = (j + 1) / transition_length
-                        interpolated_step = int(current_step + progress *
-                                                (next_step - current_step))
-                        smoothed[transition_idx] = max(
-                            1, min(6, interpolated_step))
+        # Extract uncertainty scores from segments
+        uncertainty_scores = []
+        for segment in segments:
+            for _ in segment['indices']:
+                uncertainty_scores.append(segment['avg_uncertainty'])
 
-        return smoothed
+        # Print compact uncertainty curve
+        print("\nUNCERTAINTY CURVE (█=certain, ▁=uncertain):")
+        sample_rate = max(1, len(uncertainty_scores) // 60)
+        for i in range(0, len(uncertainty_scores), sample_rate):
+            score = uncertainty_scores[i]
+            symbol = "█" if score >= -2.0 else "▄" if score >= -4.0 else "▁"
+            print(symbol, end="")
+        print()
+
+        # Print step size comparison
+        print("\nSTEP SIZES:")
+        print("Orig: ", end="")
+        for i in range(0, len(smoothed_step_sizes),
+                       max(1,
+                           len(smoothed_step_sizes) // 40)):
+            size = smoothed_step_sizes[i]
+            display_size = min(size, 9) if size < 10 else 9
+            print(f"{display_size}", end="")
+        print()
+
+        print("Safe: ", end="")
+        for i in range(0, len(safe_step_sizes),
+                       max(1,
+                           len(safe_step_sizes) // 40)):
+            size = safe_step_sizes[i]
+            display_size = min(size, 9) if size < 10 else 9
+            print(f"{display_size}", end="")
+        print()
+
+        # Show actual usage patterns
+        orig_usage = self._create_usage_pattern(smoothed_step_sizes)
+        safe_usage = self._create_usage_pattern(safe_step_sizes)
+
+        print("\nUSAGE PATTERNS:")
+        print("Orig: ", end="")
+        for i in range(0, len(orig_usage), max(1, len(orig_usage) // 60)):
+            print(orig_usage[i], end="")
+        print()
+
+        print("Safe: ", end="")
+        for i in range(0, len(safe_usage), max(1, len(safe_usage) // 60)):
+            print(safe_usage[i], end="")
+        print()
+
+        # NEW: Show FULL text alignment with step sizes
+        print("\nFULL TEXT ALIGNMENT:")
+
+        if tokens and len(tokens) > 0:
+            # Show all tokens, not just a subset
+            max_display_tokens = len(tokens)
+
+            # Break into chunks for better readability if too many tokens
+            chunk_size = 20  # Show 20 tokens per chunk
+
+            for chunk_start in range(0, max_display_tokens, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, max_display_tokens)
+
+                print(f"\nTokens {chunk_start}-{chunk_end-1}:")
+                print("-" * 80)
+
+                # Position row
+                print("Position: ", end="")
+                for i in range(chunk_start, chunk_end):
+                    print(f"{i:>8d}", end=" ")
+                print()
+
+                # Text row
+                print("Text:     ", end="")
+                for i in range(chunk_start, chunk_end):
+                    token = tokens[i] if i < len(tokens) else "<?>"
+                    # Clean up the token for display
+                    clean_token = token.replace('\n',
+                                                '\\n').replace('\t',
+                                                               '\\t').strip()
+                    display_token = clean_token[:7] if len(
+                        clean_token) <= 7 else clean_token[:6] + "+"
+                    print(f"{display_token:>8s}", end=" ")
+                print()
+
+                # Original step sizes row
+                print("Orig:     ", end="")
+                for i in range(chunk_start, chunk_end):
+                    size = smoothed_step_sizes[i] if i < len(
+                        smoothed_step_sizes) else 1
+                    print(f"{size:>8d}", end=" ")
+                print()
+
+                # Safe step sizes row
+                print("Safe:     ", end="")
+                for i in range(chunk_start, chunk_end):
+                    size = safe_step_sizes[i] if i < len(
+                        safe_step_sizes) else 1
+                    print(f"{size:>8d}", end=" ")
+                print()
+
+                # Uncertainty row
+                print("Uncertain:", end="")
+                for i in range(chunk_start, chunk_end):
+                    if i < len(uncertainty_scores):
+                        symbol = "Y" if uncertainty_scores[i] < -2.0 else "N"
+                    else:
+                        symbol = "?"
+                    print(f"{symbol:>8s}", end=" ")
+                print()
+        else:
+            print("No text tokens available for alignment")
+
+        # Print summary statistics
+        total = len(uncertainty_scores)
+        uncertain_count = sum(1 for score in uncertainty_scores
+                              if score < -2.0)
+        positions_safer = sum(1 for i in range(len(safe_step_sizes))
+                              if safe_step_sizes[i] < smoothed_step_sizes[i])
+
+        # Calculate actual steps that will be taken
+        orig_steps = len([c for c in orig_usage if c.isdigit()])
+        safe_steps = len([c for c in safe_usage if c.isdigit()])
+
+        print("\nSUMMARY:")
+        print(f"  Total tokens: {total}")
+        print(f"  Text tokens: {len(tokens)}")
+        print(f"  Uncertain areas: {uncertain_count} "
+              f"({uncertain_count/total*100:.1f}%)")
+        print(f"  Positions made safer: {positions_safer} "
+              f"({positions_safer/total*100:.1f}%)")
+        print(
+            f"  Actual steps taken: {safe_steps} (safe) vs {orig_steps} (orig)"
+        )
+        print(f"  Step size 1 count: {safe_step_sizes.count(1)} (safe) "
+              f"vs {smoothed_step_sizes.count(1)} (orig)")
+        print("=" * 80 + "\n")
 
     async def _perform_beam_search(
             self, prompts: list[PromptType], sampling_params: SamplingParams,
@@ -691,9 +813,6 @@ class OpenAISpeechToText(OpenAIServing):
 
             # Generate tokens one by one up to max_tokens
             max_beam_tokens = sampling_params.max_tokens
-            print(f"Starting beam search for prompt {prompt_idx} "
-                  f"with max tokens {max_beam_tokens}")
-            print(f"prompt: {prompt}")
 
             # Step 3: Perform beam search using dynamic step sizes
             current_position = 0
@@ -782,7 +901,6 @@ class OpenAISpeechToText(OpenAIServing):
             # Store the best beam for this prompt
             if beams:
                 best_beam = max(beams, key=lambda x: x[2])  # Best by logprob
-                print(f"Best beam for prompt {prompt_idx}: {best_beam}")
                 beam_results.append(best_beam)
             else:
                 beam_results.append(([], "", 0.0, True))  # Empty result
@@ -813,9 +931,7 @@ class OpenAISpeechToText(OpenAIServing):
                         return
 
                     # TODO:
-                    # 1. test with german audio
-                    # 2. better step sizes
-                    # 3. deploy
+                    # 1. better step sizes
                     # only finish on finish signal
                     if output.finish_reason is not None:
                         # Process logprobs efficiently and extract
