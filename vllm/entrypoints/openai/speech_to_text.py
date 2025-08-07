@@ -189,10 +189,20 @@ class OpenAISpeechToText(OpenAIServing):
                 # warning when not
                 # "fake" beam search only works with prefix caching enabled
 
+                print("Request step sizes: ", request.step_sizes, request)
                 # Perform beam search with the new method
                 list_result_generator = await self._perform_beam_search(
-                    prompts, sampling_params, request_id, beam_size)
+                    prompts,
+                    sampling_params,
+                    request_id,
+                    step_sizes=request.step_sizes if not None else [],
+                    beam_size=beam_size)
             else:
+                if request.stream:
+                    # not supported due to returning uncertainty scores
+                    return self.create_error_response(
+                        "Streaming is not supported for uncertainty analysis.")
+                sampling_params.logprobs = 20
                 list_result_generator = [
                     self.engine_client.generate(
                         prompt,
@@ -200,6 +210,7 @@ class OpenAISpeechToText(OpenAIServing):
                         request_id,
                     ) for prompt in prompts
                 ]
+
         except ValueError as e:
             # TODO: Use a vllm-specific Validation Error
             return self.create_error_response(str(e))
@@ -212,10 +223,42 @@ class OpenAISpeechToText(OpenAIServing):
         try:
             assert list_result_generator is not None
             text = ""
+            uncertainty_scores = []
+            step_sizes = []
             for result_generator in list_result_generator:
+                all_logprobs = []
                 async for op in result_generator:
                     text += op.outputs[0].text
-            return cast(T, response_class(text=text))
+                    if op.outputs[0].logprobs:
+                        all_logprobs = op.outputs[0].logprobs
+                for logprob in all_logprobs:
+                    token_logprobs = list(logprob.items())
+                    # Calculate uncertainty based on top 5 logprobs
+                    uncertainty_score = (
+                        self._calculate_uncertainty_from_top_logprobs(
+                            token_logprobs[:5]))
+                    uncertainty_scores.append(uncertainty_score)
+
+                # Step 2: Build uncertainty profile and calculate step sizes
+                # using segments
+                step_sizes = self._build_step_sizes_from_segments(
+                    uncertainty_scores)
+
+                print(f"  Step sizes: {step_sizes}")
+                print(f"  Total tokens: {len(step_sizes)}")
+                print("  Step size distribution:")
+                for size in range(1, 7):
+                    count = step_sizes.count(size)
+                    percentage = ((count / len(step_sizes)) *
+                                  100 if step_sizes else 0)
+                    print(f"    Size {size}: {count} tokens "
+                          f"({percentage:.1f}%)")
+
+            return cast(
+                T,
+                response_class(text=text,
+                               uncertainty=uncertainty_scores,
+                               step_sizes=step_sizes))
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
         except ValueError as e:
@@ -618,7 +661,7 @@ class OpenAISpeechToText(OpenAIServing):
 
     async def _perform_beam_search(
             self, prompts: list[PromptType], sampling_params: SamplingParams,
-            request_id: str,
+            request_id: str, step_sizes: list[int],
             beam_size: int) -> list[AsyncGenerator[RequestOutput, None]]:
         """Perform beam search for speech-to-text generation.
         
@@ -652,52 +695,6 @@ class OpenAISpeechToText(OpenAIServing):
                   f"with max tokens {max_beam_tokens}")
             print(f"prompt: {prompt}")
 
-            # Step 1: Run initial transcription to get logprob uncertainties
-            initial_sampling_params = SamplingParams(
-                max_tokens=max_beam_tokens,
-                temperature=0.0,
-                logprobs=20,  # Get logprobs for uncertainty analysis
-                n=1,
-                repetition_penalty=sampling_params.repetition_penalty,
-            )
-
-            initial_request_id = f"{request_id}-initial-{prompt_idx}"
-            initial_result_generator = self.engine_client.generate(
-                prompt, initial_sampling_params, initial_request_id)
-
-            all_logprobs = []
-            uncertainty_scores = []
-            async for result in initial_result_generator:
-                for output in result.outputs:
-                    print(f"Logprob len {len(output.logprobs)} "
-                          f"for prompt {prompt_idx}")
-                    # print(f"Output for prompt {prompt_idx}: {output}")
-                    if output.logprobs:
-                        all_logprobs = output.logprobs
-                        # Extract top 5 logprobs for uncertainty analysis
-            for logprob in all_logprobs:
-                token_logprobs = list(logprob.items())
-                # Calculate uncertainty based on top 5 logprobs
-                uncertainty_score = (
-                    self._calculate_uncertainty_from_top_logprobs(
-                        token_logprobs[:5]))
-                uncertainty_scores.append(uncertainty_score)
-
-            # Step 2: Build uncertainty profile and calculate step sizes
-            # using segments
-            step_sizes = self._build_step_sizes_from_segments(
-                uncertainty_scores)
-
-            print(f"Segment-based step sizes for prompt {prompt_idx}:")
-            print(f"  Step sizes: {step_sizes}")
-            print(f"  Total tokens: {len(step_sizes)}")
-            print("  Step size distribution:")
-            for size in range(1, 7):
-                count = step_sizes.count(size)
-                percentage = ((count / len(step_sizes)) *
-                              100 if step_sizes else 0)
-                print(f"    Size {size}: {count} tokens ({percentage:.1f}%)")
-
             # Step 3: Perform beam search using dynamic step sizes
             current_position = 0
             while current_position < max_beam_tokens:
@@ -710,7 +707,9 @@ class OpenAISpeechToText(OpenAIServing):
                       f"current beams: {len(beams)}")
 
                 # Determine current step size
-                if current_position < len(step_sizes):
+                if step_sizes is None:
+                    current_step_size = 1  # Default step size
+                elif current_position < len(step_sizes):
                     current_step_size = step_sizes[current_position]
                 else:
                     current_step_size = 1  # Default fallback
@@ -813,18 +812,25 @@ class OpenAISpeechToText(OpenAIServing):
                             (beam_tokens, beam_text, beam_logprob, True))
                         return
 
-                    # Process logprobs efficiently and extract text from output
-                    candidates_added = self._process_beam_candidates(
-                        beam_tokens, beam_text, beam_logprob,
-                        output.logprobs[0], eos_token_id, logprob_threshold,
-                        max_beam_tokens, output.finish_reason, new_beams)
+                    # TODO:
+                    # 1. test with german audio
+                    # 2. better step sizes
+                    # 3. deploy
+                    # only finish on finish signal
+                    if output.finish_reason is not None:
+                        # Process logprobs efficiently and extract
+                        # text from output
+                        candidates_added = self._process_beam_candidates(
+                            beam_tokens, beam_text, beam_logprob,
+                            output.logprobs, eos_token_id, logprob_threshold,
+                            max_beam_tokens, output.finish_reason, new_beams)
 
-                    print(f"Beam {beam_idx}: added {candidates_added} "
-                          f"candidates")
-                    return
+                        print(f"Beam {beam_idx}: added {candidates_added} "
+                              f"candidates")
+                        return
 
             except Exception as e:
-                print(f"Error in beam {beam_idx}: {e}")
+                print(f"Error in beam {beam_idx}: {str(e)}")
                 new_beams.append((beam_tokens, beam_text, beam_logprob, True))
 
         # Run all tasks concurrently for better performance
@@ -841,43 +847,152 @@ class OpenAISpeechToText(OpenAIServing):
                 new_beams.append((beam_tokens, beam_text, beam_logprob, True))
 
     def _process_beam_candidates(self, beam_tokens: list, beam_text: str,
-                                 beam_logprob: float, logprobs_dict: dict,
+                                 beam_logprob: float, output_logprobs: list,
                                  eos_token_id: Optional[int],
                                  logprob_threshold: float,
                                  max_beam_tokens: int,
                                  finish_reason: Optional[str],
                                  new_beams: list) -> int:
-        """Process candidates for a single beam efficiently."""
+        """Process candidates for a single beam efficiently, handling both 
+        single and multiple tokens."""
         candidates_added = 0
 
-        # Pre-filter candidates by logprob threshold for efficiency
-        valid_candidates = [
-            (token_id, logprob_data)
-            for token_id, logprob_data in logprobs_dict.items()
-            if logprob_data.logprob >= logprob_threshold
-        ]
-
-        if not valid_candidates:
-            # No valid candidates, mark beam as finished
+        # Handle case where no logprobs are available
+        if not output_logprobs:
             new_beams.append((beam_tokens, beam_text, beam_logprob, True))
             return 0
 
-        for token_id, logprob_data in valid_candidates:
-            new_beam_tokens = beam_tokens + [token_id]
-            new_beam_text = beam_text + logprob_data.decoded_token
-            new_beam_logprob = beam_logprob + logprob_data.logprob
+        # Check if this is single token generation (original case)
+        if len(output_logprobs) == 1:
+            # Original single token logic - explore all valid candidates
+            logprobs_dict = output_logprobs[0]
 
-            # Determine if beam should finish
-            is_beam_finished = (
-                (eos_token_id is not None and token_id == eos_token_id)
-                or (finish_reason is not None and finish_reason != "length")
-                or (len(new_beam_tokens) >= max_beam_tokens))
+            # Pre-filter candidates by logprob threshold for efficiency
+            valid_candidates = [
+                (token_id, logprob_data)
+                for token_id, logprob_data in logprobs_dict.items()
+                if logprob_data.logprob >= logprob_threshold
+            ]
 
-            new_beams.append((new_beam_tokens, new_beam_text, new_beam_logprob,
-                              is_beam_finished))
-            candidates_added += 1
+            if not valid_candidates:
+                # No valid candidates, mark beam as finished
+                new_beams.append((beam_tokens, beam_text, beam_logprob, True))
+                return 0
 
-        return candidates_added
+            for token_id, logprob_data in valid_candidates:
+                new_beam_tokens = beam_tokens + [token_id]
+                new_beam_text = beam_text + logprob_data.decoded_token
+                new_beam_logprob = beam_logprob + logprob_data.logprob
+
+                # Determine if beam should finish
+                is_beam_finished = (
+                    (eos_token_id is not None and token_id == eos_token_id) or
+                    (finish_reason is not None and finish_reason != "length")
+                    or (len(new_beam_tokens) >= max_beam_tokens))
+
+                new_beams.append((new_beam_tokens, new_beam_text,
+                                  new_beam_logprob, is_beam_finished))
+                candidates_added += 1
+
+            return candidates_added
+
+        else:
+            # Multi-token case - take best path through all positions except
+            # the last,
+            # then explore multiple candidates at the final position
+            accumulated_tokens = []
+            accumulated_text = ""
+            accumulated_logprob = 0.0
+            beam_finished = False
+
+            # Process all positions except the last one (take best candidate
+            # only)
+            for token_pos in range(len(output_logprobs) - 1):
+                logprobs_dict = output_logprobs[token_pos]
+
+                # Pre-filter candidates by logprob threshold
+                valid_candidates = [
+                    (token_id, logprob_data)
+                    for token_id, logprob_data in logprobs_dict.items()
+                    if logprob_data.logprob >= logprob_threshold
+                ]
+
+                if not valid_candidates:
+                    # No valid candidates at this position, stop processing
+                    beam_finished = True
+                    break
+
+                # Take only the best candidate for intermediate positions
+                best_token_id, best_logprob_data = max(
+                    valid_candidates, key=lambda x: x[1].logprob)
+
+                accumulated_tokens.append(best_token_id)
+                accumulated_text += best_logprob_data.decoded_token
+                accumulated_logprob += best_logprob_data.logprob
+
+                # Check for EOS token or other finish conditions
+                if (eos_token_id is not None
+                        and best_token_id == eos_token_id):
+                    beam_finished = True
+                    break
+
+                # Check if we've reached max tokens
+                if len(beam_tokens) + len(
+                        accumulated_tokens) >= max_beam_tokens:
+                    beam_finished = True
+                    break
+
+            # If we finished early or have issues, create single beam
+            if beam_finished or len(output_logprobs) == 0:
+                new_beam_tokens = beam_tokens + accumulated_tokens
+                new_beam_text = beam_text + accumulated_text
+                new_beam_logprob = beam_logprob + accumulated_logprob
+
+                new_beams.append(
+                    (new_beam_tokens, new_beam_text, new_beam_logprob, True))
+                return 1
+
+            # Process the final position - explore multiple candidates here
+            final_logprobs_dict = output_logprobs[-1]
+
+            final_valid_candidates = [
+                (token_id, logprob_data)
+                for token_id, logprob_data in final_logprobs_dict.items()
+                if logprob_data.logprob >= logprob_threshold
+            ]
+
+            if not final_valid_candidates:
+                # No valid candidates at final position
+                new_beam_tokens = beam_tokens + accumulated_tokens
+                new_beam_text = beam_text + accumulated_text
+                new_beam_logprob = beam_logprob + accumulated_logprob
+
+                new_beams.append(
+                    (new_beam_tokens, new_beam_text, new_beam_logprob, True))
+                return 1
+
+            # Create multiple beams for each valid candidate at the final
+            # position
+            for token_id, logprob_data in final_valid_candidates:
+                final_tokens = accumulated_tokens + [token_id]
+                final_text = accumulated_text + logprob_data.decoded_token
+                final_logprob = accumulated_logprob + logprob_data.logprob
+
+                new_beam_tokens = beam_tokens + final_tokens
+                new_beam_text = beam_text + final_text
+                new_beam_logprob = beam_logprob + final_logprob
+
+                # Determine if beam should finish
+                is_beam_finished = (
+                    (eos_token_id is not None and token_id == eos_token_id) or
+                    (finish_reason is not None and finish_reason != "length")
+                    or (len(new_beam_tokens) >= max_beam_tokens))
+
+                new_beams.append((new_beam_tokens, new_beam_text,
+                                  new_beam_logprob, is_beam_finished))
+                candidates_added += 1
+
+            return candidates_added
 
     def _create_beam_result_generators(
             self, beam_results: list, prompts: list[PromptType],
