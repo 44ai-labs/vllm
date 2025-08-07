@@ -495,6 +495,7 @@ class OpenAISpeechToText(OpenAIServing):
         
         Args:
             uncertainty_scores: List of uncertainty scores for each token
+            tokens: List of text tokens
             
         Returns:
             List of step sizes for each token position
@@ -504,37 +505,48 @@ class OpenAISpeechToText(OpenAIServing):
 
         # Simple uncertainty threshold - anything below this is uncertain
         uncertainty_threshold = -2.0  # Uncertain if score < -2.0
+        padding_uncertainty = 1  # Number of positions to pad around
 
-        # First pass: identify segments of similar uncertainty
+        # Step 1: Get all uncertain positions
+        uncertain_positions = set()
+        for i, score in enumerate(uncertainty_scores):
+            if score < uncertainty_threshold:
+                uncertain_positions.add(i)
+
+        # Step 2: Apply padding around uncertain positions
+        padded_uncertain_positions = set(uncertain_positions)
+        for pos in uncertain_positions:
+            # Add padding before and after
+            for offset in range(-padding_uncertainty, padding_uncertainty + 1):
+                padded_pos = pos + offset
+                if 0 <= padded_pos < len(uncertainty_scores):
+                    padded_uncertain_positions.add(padded_pos)
+
+        # Step 3: Create segments based on padded uncertainty
         segments = []
         current_segment = {
             'start': 0,
-            'scores': [uncertainty_scores[0]],
             'indices': [0],
-            'is_uncertain': uncertainty_scores[0] < uncertainty_threshold
+            'is_uncertain': 0 in padded_uncertain_positions
         }
 
-        # Group consecutive tokens with similar uncertainty levels
+        # Group consecutive tokens with similar uncertainty
+        # levels (after padding)
         for i in range(1, len(uncertainty_scores)):
-            is_current_uncertain = uncertainty_scores[
-                i] < uncertainty_threshold
+            is_current_uncertain = i in padded_uncertain_positions
 
             # Continue segment if uncertainty level is the same
             if is_current_uncertain == current_segment['is_uncertain']:
-                current_segment['scores'].append(uncertainty_scores[i])
                 current_segment['indices'].append(i)
             else:
                 # End current segment and start new one
                 current_segment['end'] = current_segment['indices'][-1]
                 current_segment['length'] = len(current_segment['indices'])
-                current_segment['avg_uncertainty'] = sum(
-                    current_segment['scores']) / len(current_segment['scores'])
                 segments.append(current_segment)
 
                 # Start new segment
                 current_segment = {
                     'start': i,
-                    'scores': [uncertainty_scores[i]],
                     'indices': [i],
                     'is_uncertain': is_current_uncertain
                 }
@@ -542,28 +554,23 @@ class OpenAISpeechToText(OpenAIServing):
         # Close last segment
         current_segment['end'] = current_segment['indices'][-1]
         current_segment['length'] = len(current_segment['indices'])
-        current_segment['avg_uncertainty'] = sum(
-            current_segment['scores']) / len(current_segment['scores'])
         segments.append(current_segment)
 
-        # Second pass: assign step sizes based on segment characteristics
-        step_sizes = [1] * len(
-            uncertainty_scores)  # Initialize with conservative step size
+        # Step 4: Assign step sizes based on segments
+        step_sizes = []
 
         for segment in segments:
-            # Uncertain regions: always step size 1
             step_size = 1 if segment['is_uncertain'] else segment['length']
-
-            # Apply the step size to all tokens in the segment
-            for idx in segment['indices']:
-                step_sizes[idx] = step_size
+            for _ in segment['indices']:
+                step_sizes.append(step_size)
 
         # Create safe step sizes that respect high-uncertainty areas
         safe_step_sizes = self._create_safe_step_sizes(step_sizes)
 
         # Print uncertainty curve and step sizes for visualization
-        self._print_uncertainty_curve_and_step_sizes(segments, step_sizes,
-                                                     safe_step_sizes, tokens)
+        self._print_uncertainty_curve_and_step_sizes(
+            step_sizes, safe_step_sizes, tokens, uncertainty_scores,
+            padded_uncertain_positions)
 
         return safe_step_sizes
 
@@ -601,42 +608,13 @@ class OpenAISpeechToText(OpenAIServing):
 
         return safe_step_sizes
 
-    def _create_usage_pattern(self, step_sizes: list[int]) -> str:
-        """Create a string showing how the step sizes will 
-        actually be used during beam search.
-        
-        Args:
-            step_sizes: List of step sizes for each position
-            
-        Returns:
-            String showing the actual usage pattern (e.g., "6xxxxx111116xxxxx")
-        """
-        if not step_sizes:
-            return ""
-
-        usage_pattern = []
-        position = 0
-
-        while position < len(step_sizes):
-            current_step = step_sizes[position]
-
-            # Add the step size digit
-            usage_pattern.append(str(current_step))
-
-            # Add 'x' for the positions that will be skipped
-            for _ in range(1, current_step):
-                if position + _ < len(step_sizes):
-                    usage_pattern.append('x')
-
-            # Move to next position
-            position += current_step
-
-        return ''.join(usage_pattern)
-
-    def _print_uncertainty_curve_and_step_sizes(self, segments: list,
-                                                smoothed_step_sizes: list[int],
-                                                safe_step_sizes: list[int],
-                                                tokens: list[str]) -> None:
+    def _print_uncertainty_curve_and_step_sizes(
+            self,
+            smoothed_step_sizes: list[int],
+            safe_step_sizes: list[int],
+            tokens: list[str],
+            uncertainty_scores: list[float],
+            padded_uncertain_positions: set = None) -> None:
         """Print compact visualization of uncertainty curve and step 
         sizes with text alignment."""
         print("\n" + "=" * 80)
@@ -644,54 +622,41 @@ class OpenAISpeechToText(OpenAIServing):
         print("=" * 80)
 
         # Extract uncertainty scores from segments
-        uncertainty_scores = []
-        for segment in segments:
-            for _ in segment['indices']:
-                uncertainty_scores.append(segment['avg_uncertainty'])
 
         # Print compact uncertainty curve
         print("\nUNCERTAINTY CURVE (█=certain, ▁=uncertain):")
-        sample_rate = max(1, len(uncertainty_scores) // 60)
+        sample_rate = 1
         for i in range(0, len(uncertainty_scores), sample_rate):
             score = uncertainty_scores[i]
             symbol = "█" if score >= -2.0 else "▄" if score >= -4.0 else "▁"
             print(symbol, end="")
         print()
 
-        # Print step size comparison
-        print("\nSTEP SIZES:")
-        print("Orig: ", end="")
-        for i in range(0, len(smoothed_step_sizes),
-                       max(1,
-                           len(smoothed_step_sizes) // 40)):
-            size = smoothed_step_sizes[i]
-            display_size = min(size, 9) if size < 10 else 9
-            print(f"{display_size}", end="")
-        print()
+        simulated_step_sizes = []
 
-        print("Safe: ", end="")
-        for i in range(0, len(safe_step_sizes),
-                       max(1,
-                           len(safe_step_sizes) // 40)):
-            size = safe_step_sizes[i]
-            display_size = min(size, 9) if size < 10 else 9
-            print(f"{display_size}", end="")
-        print()
+        current_step_size = -1
+        for i in range(len(safe_step_sizes)):
+            if current_step_size == -1:
+                current_step_size = safe_step_sizes[i]
+            if current_step_size > 1:
+                if len(simulated_step_sizes) > 0:
+                    if simulated_step_sizes[-1] == -1 or simulated_step_sizes[
+                            -1] == 1 or simulated_step_sizes[
+                                -1] == current_step_size + 1:
+                        simulated_step_sizes.append(-1)
+                    else:
+                        simulated_step_sizes.append(current_step_size)
+                else:
+                    simulated_step_sizes.append(current_step_size)
+            else:
+                simulated_step_sizes.append(1)
+            current_step_size -= 1
+            if current_step_size <= 0:
+                current_step_size = -1
 
-        # Show actual usage patterns
-        orig_usage = self._create_usage_pattern(smoothed_step_sizes)
-        safe_usage = self._create_usage_pattern(safe_step_sizes)
-
-        print("\nUSAGE PATTERNS:")
-        print("Orig: ", end="")
-        for i in range(0, len(orig_usage), max(1, len(orig_usage) // 60)):
-            print(orig_usage[i], end="")
-        print()
-
-        print("Safe: ", end="")
-        for i in range(0, len(safe_usage), max(1, len(safe_usage) // 60)):
-            print(safe_usage[i], end="")
-        print()
+        print("\nSIMULATED STEP SIZES ")
+        print(" ".join((f"{size:>2d}") if size > 0 else "x"
+                       for size in simulated_step_sizes))
 
         # NEW: Show FULL text alignment with step sizes
         print("\nFULL TEXT ALIGNMENT:")
@@ -728,31 +693,32 @@ class OpenAISpeechToText(OpenAIServing):
                     print(f"{display_token:>8s}", end=" ")
                 print()
 
-                # Original step sizes row
-                print("Orig:     ", end="")
-                for i in range(chunk_start, chunk_end):
-                    size = smoothed_step_sizes[i] if i < len(
-                        smoothed_step_sizes) else 1
-                    print(f"{size:>8d}", end=" ")
-                print()
-
                 # Safe step sizes row
-                print("Safe:     ", end="")
+                print("Step:     ", end="")
                 for i in range(chunk_start, chunk_end):
-                    size = safe_step_sizes[i] if i < len(
-                        safe_step_sizes) else 1
-                    print(f"{size:>8d}", end=" ")
+                    size = simulated_step_sizes[i]
+                    if size == -1:
+                        print(f"{'x':>8s}", end=" ")  # Empty for -1
+                    else:
+                        print(f"{size:>8d}", end=" ")
                 print()
 
-                # Uncertainty row
+                # Uncertainty row (original)
                 print("Uncertain:", end="")
                 for i in range(chunk_start, chunk_end):
                     if i < len(uncertainty_scores):
-                        symbol = "Y" if uncertainty_scores[i] < -2.0 else "N"
+                        score = uncertainty_scores[i]
+                        print(f"{score:>8.3f}", end=" ")
                     else:
-                        symbol = "?"
-                    print(f"{symbol:>8s}", end=" ")
+                        print(f"{'?':>8s}", end=" ")
                 print()
+
+                if padded_uncertain_positions is not None:
+                    print("Padded:   ", end="")
+                    for i in range(chunk_start, chunk_end):
+                        symbol = "Y" if i in padded_uncertain_positions else "N"
+                        print(f"{symbol:>8s}", end=" ")
+                    print()
         else:
             print("No text tokens available for alignment")
 
@@ -760,23 +726,21 @@ class OpenAISpeechToText(OpenAIServing):
         total = len(uncertainty_scores)
         uncertain_count = sum(1 for score in uncertainty_scores
                               if score < -2.0)
+        padded_count = len(
+            padded_uncertain_positions) if padded_uncertain_positions else 0
         positions_safer = sum(1 for i in range(len(safe_step_sizes))
                               if safe_step_sizes[i] < smoothed_step_sizes[i])
-
-        # Calculate actual steps that will be taken
-        orig_steps = len([c for c in orig_usage if c.isdigit()])
-        safe_steps = len([c for c in safe_usage if c.isdigit()])
 
         print("\nSUMMARY:")
         print(f"  Total tokens: {total}")
         print(f"  Text tokens: {len(tokens)}")
-        print(f"  Uncertain areas: {uncertain_count} "
+        print(f"  Original uncertain areas: {uncertain_count} "
               f"({uncertain_count/total*100:.1f}%)")
+        if padded_uncertain_positions:
+            print(f"  With padding uncertain areas: {padded_count} "
+                  f"({padded_count/total*100:.1f}%)")
         print(f"  Positions made safer: {positions_safer} "
               f"({positions_safer/total*100:.1f}%)")
-        print(
-            f"  Actual steps taken: {safe_steps} (safe) vs {orig_steps} (orig)"
-        )
         print(f"  Step size 1 count: {safe_step_sizes.count(1)} (safe) "
               f"vs {smoothed_step_sizes.count(1)} (orig)")
         print("=" * 80 + "\n")
@@ -892,6 +856,14 @@ class OpenAISpeechToText(OpenAIServing):
                 new_beams.sort(key=lambda x: x[2], reverse=True)
                 beams = new_beams[:beam_size]
 
+                # Good Debugging Print
+                # print(f"New beams after step {current_position + 1}: ")
+                # for idx, (tokens, text, logprob, finished)
+                # in enumerate(beams):
+                #     print(f"  Beam {idx}: "
+                #           f"text='{text}', logprob={logprob}, "
+                #           f"finished={finished}")
+
                 if not beams:
                     break
 
@@ -936,13 +908,13 @@ class OpenAISpeechToText(OpenAIServing):
                     if output.finish_reason is not None:
                         # Process logprobs efficiently and extract
                         # text from output
-                        candidates_added = self._process_beam_candidates(
+                        _candidates_added = self._process_beam_candidates(
                             beam_tokens, beam_text, beam_logprob,
                             output.logprobs, eos_token_id, logprob_threshold,
                             max_beam_tokens, output.finish_reason, new_beams)
 
-                        print(f"Beam {beam_idx}: added {candidates_added} "
-                              f"candidates")
+                        # print(f"Beam {beam_idx}: added {candidates_added} "
+                        #       f"candidates")
                         return
 
             except Exception as e:
