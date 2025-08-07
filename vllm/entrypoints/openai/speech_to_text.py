@@ -473,16 +473,16 @@ class OpenAISpeechToText(OpenAIServing):
         # Start from maximum uncertainty (-5) and add certainty factors
         uncertainty_score = -5.0  # Start at maximum uncertainty
 
-        print("Uncertainty metrics: ")
-        print(f"  Entropy: {normalized_entropy:.3f}")
-        print(f"  Top gap: {top_gap:.3f}")
-        print(f"  Concentration: {concentration:.3f}")
+        # print("Uncertainty metrics: ")
+        # print(f"  Entropy: {normalized_entropy:.3f}")
+        # print(f"  Top gap: {top_gap:.3f}")
+        # print(f"  Concentration: {concentration:.3f}")
         # Add certainty contributions (all positive, bringing score toward 0)
         uncertainty_score += 2.0 * (1 - normalized_entropy)
         uncertainty_score += 2.0 * top_gap
         uncertainty_score += 1.0 * concentration
 
-        print(f"Calculated uncertainty score: {uncertainty_score:.3f} ")
+        # print(f"Calculated uncertainty score: {uncertainty_score:.3f} ")
         # Clamp to reasonable range
         uncertainty_score = max(-5.0, min(0.0, uncertainty_score))
 
@@ -522,96 +522,37 @@ class OpenAISpeechToText(OpenAIServing):
                 if 0 <= padded_pos < len(uncertainty_scores):
                     padded_uncertain_positions.add(padded_pos)
 
-        # Step 3: Create segments based on padded uncertainty
-        segments = []
-        current_segment = {
-            'start': 0,
-            'indices': [0],
-            'is_uncertain': 0 in padded_uncertain_positions
-        }
-
-        # Group consecutive tokens with similar uncertainty
-        # levels (after padding)
-        for i in range(1, len(uncertainty_scores)):
-            is_current_uncertain = i in padded_uncertain_positions
-
-            # Continue segment if uncertainty level is the same
-            if is_current_uncertain == current_segment['is_uncertain']:
-                current_segment['indices'].append(i)
-            else:
-                # End current segment and start new one
-                current_segment['end'] = current_segment['indices'][-1]
-                current_segment['length'] = len(current_segment['indices'])
-                segments.append(current_segment)
-
-                # Start new segment
-                current_segment = {
-                    'start': i,
-                    'indices': [i],
-                    'is_uncertain': is_current_uncertain
-                }
-
-        # Close last segment
-        current_segment['end'] = current_segment['indices'][-1]
-        current_segment['length'] = len(current_segment['indices'])
-        segments.append(current_segment)
-
-        # Step 4: Assign step sizes based on segments
         step_sizes = []
-
-        for segment in segments:
-            step_size = 1 if segment['is_uncertain'] else segment['length']
-            for _ in segment['indices']:
-                step_sizes.append(step_size)
-
-        # Create safe step sizes that respect high-uncertainty areas
-        safe_step_sizes = self._create_safe_step_sizes(step_sizes)
+        simulated_step_sizes = []
+        last_step_index = 0
+        step_size_counter = 1
+        for i in range(len(uncertainty_scores)):
+            step_sizes.append(1)  # Default step size is 1
+            simulated_step_sizes.append(1)
+            if i in padded_uncertain_positions:
+                step_size_counter = 0
+                last_step_index = i
+            else:
+                step_size_counter += 1
+                if step_size_counter == 1:
+                    last_step_index = i
+                else:
+                    simulated_step_sizes[last_step_index] = step_size_counter
+                    simulated_step_sizes[i] = -1
+                    step_sizes[last_step_index] = step_size_counter
 
         # Print uncertainty curve and step sizes for visualization
-        self._print_uncertainty_curve_and_step_sizes(
-            step_sizes, safe_step_sizes, tokens, uncertainty_scores,
-            padded_uncertain_positions)
+        # DEBUG: activate that for debugging
+        # self._print_uncertainty_curve_and_step_sizes(
+        #     step_sizes, simulated_step_sizes, tokens, uncertainty_scores,
+        #     padded_uncertain_positions)
 
-        return safe_step_sizes
-
-    def _create_safe_step_sizes(self, step_sizes: list[int]) -> list[int]:
-        """Create safe step sizes that respect high-uncertainty areas.
-        
-        For each position, the safe step size is the minimum of:
-        1. The suggested step size at that position
-        2. The minimum step size in the potential lookahead window
-        
-        This ensures we never jump over areas marked as high-uncertainty 
-        (step size 1).
-        """
-        if not step_sizes:
-            return []
-
-        safe_step_sizes = []
-
-        for i in range(len(step_sizes)):
-            suggested_step = step_sizes[i]
-
-            # Look ahead in the window we could potentially step through
-            lookahead_end = min(i + suggested_step, len(step_sizes))
-            window_step_sizes = step_sizes[i:lookahead_end]
-
-            # If any position in our potential step has high uncertainty
-            # (step size 1),
-            # we must use step size 1 to not skip over it
-            min_step_in_window = min(
-                window_step_sizes) if window_step_sizes else 1
-
-            # The safe step size is the minimum of what we want and what's safe
-            safe_step_size = min(suggested_step, min_step_in_window)
-            safe_step_sizes.append(safe_step_size)
-
-        return safe_step_sizes
+        return simulated_step_sizes
 
     def _print_uncertainty_curve_and_step_sizes(
             self,
-            smoothed_step_sizes: list[int],
-            safe_step_sizes: list[int],
+            step_sizes: list[int],
+            simulated_step_sizes: list[int],
             tokens: list[str],
             uncertainty_scores: list[float],
             padded_uncertain_positions: set = None) -> None:
@@ -631,28 +572,6 @@ class OpenAISpeechToText(OpenAIServing):
             symbol = "█" if score >= -2.0 else "▄" if score >= -4.0 else "▁"
             print(symbol, end="")
         print()
-
-        simulated_step_sizes = []
-
-        current_step_size = -1
-        for i in range(len(safe_step_sizes)):
-            if current_step_size == -1:
-                current_step_size = safe_step_sizes[i]
-            if current_step_size > 1:
-                if len(simulated_step_sizes) > 0:
-                    if simulated_step_sizes[-1] == -1 or simulated_step_sizes[
-                            -1] == 1 or simulated_step_sizes[
-                                -1] == current_step_size + 1:
-                        simulated_step_sizes.append(-1)
-                    else:
-                        simulated_step_sizes.append(current_step_size)
-                else:
-                    simulated_step_sizes.append(current_step_size)
-            else:
-                simulated_step_sizes.append(1)
-            current_step_size -= 1
-            if current_step_size <= 0:
-                current_step_size = -1
 
         print("\nSIMULATED STEP SIZES ")
         print(" ".join((f"{size:>2d}") if size > 0 else "x"
@@ -728,8 +647,6 @@ class OpenAISpeechToText(OpenAIServing):
                               if score < -2.0)
         padded_count = len(
             padded_uncertain_positions) if padded_uncertain_positions else 0
-        positions_safer = sum(1 for i in range(len(safe_step_sizes))
-                              if safe_step_sizes[i] < smoothed_step_sizes[i])
 
         print("\nSUMMARY:")
         print(f"  Total tokens: {total}")
@@ -739,10 +656,7 @@ class OpenAISpeechToText(OpenAIServing):
         if padded_uncertain_positions:
             print(f"  With padding uncertain areas: {padded_count} "
                   f"({padded_count/total*100:.1f}%)")
-        print(f"  Positions made safer: {positions_safer} "
-              f"({positions_safer/total*100:.1f}%)")
-        print(f"  Step size 1 count: {safe_step_sizes.count(1)} (safe) "
-              f"vs {smoothed_step_sizes.count(1)} (orig)")
+        print(f"  Step size 1 count: {step_sizes.count(1)} (safe) ")
         print("=" * 80 + "\n")
 
     async def _perform_beam_search(
@@ -794,6 +708,11 @@ class OpenAISpeechToText(OpenAIServing):
                     current_step_size = 1  # Default step size
                 elif current_position < len(step_sizes):
                     current_step_size = step_sizes[current_position]
+                    if current_step_size < 1:
+                        print("WARNING: step size < 1, we probably have an "
+                              " offset somewhere. Could not be bad but we "
+                              "should keep an eye on it. ")
+                        current_step_size = 1
                 else:
                     current_step_size = 1  # Default fallback
 
