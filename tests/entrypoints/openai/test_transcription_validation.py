@@ -4,6 +4,7 @@
 # imports for guided decoding tests
 import io
 import json
+import time
 from unittest.mock import patch
 
 import librosa
@@ -13,7 +14,7 @@ import pytest
 import soundfile as sf
 from openai._base_client import AsyncAPIClient
 
-from vllm.assets.audio import AudioAsset
+from vllm.assets.audio import AudioAsset, AudioAssets44ai
 
 from ...utils import RemoteOpenAIServer
 
@@ -33,6 +34,14 @@ def mary_had_lamb():
 @pytest.fixture
 def winning_call():
     path = AudioAsset('winning_call').get_local_path()
+    with open(str(path), "rb") as f:
+        yield f
+
+
+@pytest.fixture
+def audio_44ai():
+    path = AudioAssets44ai(
+        '30s_test_swiss_german_7kz53lbjqr.mp3').get_local_path()
     with open(str(path), "rb") as f:
         yield f
 
@@ -58,6 +67,111 @@ async def test_basic_audio(mary_had_lamb, model_name):
             temperature=0.0)
         out = json.loads(transcription)['text']
         assert "Mary had a little lamb," in out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", ["mistralai/Voxtral-Mini-3B-2507"])
+async def test_beam_search_transcription(audio_44ai, model_name):
+    """Test beam search functionality for transcription."""
+    server_args = ["--enforce-eager"]
+
+    if model_name.startswith("mistralai"):
+        server_args += MISTRAL_FORMAT_ARGS
+
+    with RemoteOpenAIServer(model_name, server_args) as remote_server:
+        client = remote_server.get_async_client()
+
+        transcription_regular = await client.audio.transcriptions.create(
+            model=model_name,
+            file=audio_44ai,
+            language="de",
+            response_format="text",
+            temperature=0.0,
+            extra_body={"use_beam_search": False})
+        out_regular = json.loads(transcription_regular)['text']
+        # uncertainty_scores_regular = json.loads(
+        #     transcription_regular)['uncertainty']
+        step_sizes_regular = json.loads(transcription_regular)['step_sizes']
+
+        print("Step sizes (regular):", step_sizes_regular)
+
+        # Test with beam search enabled
+        audio_44ai.seek(0)  # Reset file pointer
+        transcription_beam = await client.audio.transcriptions.create(
+            model=model_name,
+            file=audio_44ai,
+            language="de",
+            response_format="text",
+            temperature=0.0,
+            extra_body={
+                "use_beam_search": True,
+                "beam_size": 5,
+                "step_sizes": step_sizes_regular
+            })
+        out_beam = json.loads(transcription_beam)['text']
+        # uncertainty_scores = json.loads(transcription_beam)['uncertainty']
+        # step_sizes = json.loads(transcription_beam)['step_sizes']
+
+        # Test without beam search for comparison
+
+        # Both should contain the expected text
+        assert "habe ich das Gefühl" in out_beam
+        assert "habe ich das Gefühl" in out_regular
+
+        print(f"Regular transcription: {out_regular}")
+        print(f"Beam search transcription: {out_beam}")
+
+        # Beam search should not fail and should produce valid output
+        assert len(out_beam.strip()) > 0
+        assert isinstance(out_beam, str)
+
+
+@pytest.mark.asyncio
+async def test_beam_search_validation(mary_had_lamb):
+    """Test validation of beam search parameters."""
+    model_name = "mistralai/Voxtral-Mini-3B-2507"
+    server_args = ["--enforce-eager"]
+
+    with RemoteOpenAIServer(model_name, server_args) as remote_server:
+        client = remote_server.get_async_client()
+
+        # Test that streaming with beam search is rejected
+        with pytest.raises((openai.BadRequestError, Exception)):
+            await client.audio.transcriptions.create(model=model_name,
+                                                     file=mary_had_lamb,
+                                                     language="en",
+                                                     temperature=0.0,
+                                                     extra_body={
+                                                         "use_beam_search":
+                                                         True,
+                                                         "beam_size": 3,
+                                                     },
+                                                     stream=True)
+
+
+@pytest.mark.asyncio
+async def test_beam_search_parameters(mary_had_lamb):
+    """Test different beam search parameter combinations."""
+    model_name = "mistralai/Voxtral-Mini-3B-2507"
+    server_args = ["--enforce-eager"]
+
+    with RemoteOpenAIServer(model_name, server_args) as remote_server:
+        client = remote_server.get_async_client()
+
+        # Test with different beam sizes
+        for beam_size in [1, 3, 5]:
+            mary_had_lamb.seek(0)  # Reset file pointer
+            transcription = await client.audio.transcriptions.create(
+                model=model_name,
+                file=mary_had_lamb,
+                language="en",
+                response_format="text",
+                temperature=0.0,
+                use_beam_search=True,
+                beam_size=beam_size)
+            out = json.loads(transcription)['text']
+            assert len(out.strip()) > 0
+            assert "Mary had a little lamb," in out
 
 
 @pytest.mark.asyncio
@@ -277,3 +391,68 @@ async def test_audio_prompt(mary_had_lamb):
             temperature=0.0)
         out_prompt = json.loads(transcription_wprompt)['text']
         assert prefix in out_prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", ["mistralai/Voxtral-Mini-3B-2507"])
+async def test_beam_search_timing(mary_had_lamb, model_name):
+    """Test timing comparison between beam search and regular transcription."""
+    server_args = ["--enforce-eager"]
+
+    if model_name.startswith("mistralai"):
+        server_args += MISTRAL_FORMAT_ARGS
+
+    with RemoteOpenAIServer(model_name, server_args) as remote_server:
+        client = remote_server.get_async_client()
+
+        # Time regular transcription (5 runs)
+        regular_times = []
+        for i in range(5):
+            mary_had_lamb.seek(0)  # Reset file pointer
+            start_time = time.time()
+            transcription_regular = await client.audio.transcriptions.create(
+                model=model_name,
+                file=mary_had_lamb,
+                language="en",
+                response_format="text",
+                temperature=0.0,
+                extra_body={
+                    "use_beam_search": False,
+                    "max_tokens": 300
+                })
+            end_time = time.time()
+            regular_times.append(end_time - start_time)
+            print(f"Regular transcription run {i+1}: {regular_times[-1]:.2f}s")
+
+        # Time beam search transcription (5 runs)
+        beam_times = []
+        for i in range(5):
+            mary_had_lamb.seek(0)  # Reset file pointer
+            start_time = time.time()
+            transcription_beam = await client.audio.transcriptions.create(
+                model=model_name,
+                file=mary_had_lamb,
+                language="en",
+                response_format="text",
+                temperature=0.0,
+                extra_body={
+                    "use_beam_search": True,
+                    "beam_size": 5,
+                    "max_tokens": 300
+                })
+            end_time = time.time()
+            beam_times.append(end_time - start_time)
+            print(f"Beam search run {i+1}: {beam_times[-1]:.2f}s")
+
+        # Calculate averages
+        avg_regular = sum(regular_times) / len(regular_times)
+        avg_beam = sum(beam_times) / len(beam_times)
+
+        print("\nTiming Results:")
+        print(f"Regular transcription average: {avg_regular:.2f}s")
+        print(f"Beam search average: {avg_beam:.2f}s")
+        print(f"Beam search is {avg_beam/avg_regular:.1f}x slower")
+        out_regular = json.loads(transcription_regular)['text']
+        out_beam = json.loads(transcription_beam)['text']
+        print(f"Regular transcription: {out_regular}")
+        print(f"Beam search transcription: {out_beam}")
