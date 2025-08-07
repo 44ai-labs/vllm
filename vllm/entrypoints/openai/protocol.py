@@ -2119,6 +2119,16 @@ class TranscriptionRequest(OpenAIBaseModel):
     beam_size: int = 5
     """Number of beams."""
 
+    step_sizes: Optional[list[int]] = Field(
+        default=[],
+        alias="step_sizes[]",  # needed for extra args parsing somehow...
+        description=(
+            "Step sizes for the transcription, if available. "
+            "This is used to indicate the number of tokens processed at each "
+            "step in the transcription process. If not provided, defaults to "
+            "an empty list."))
+    """Step sizes for the transcription, if available."""
+
     max_tokens: Optional[int] = None
     """The maximum number of tokens to generate in the transcription."""
     # --8<-- [end:transcription-sampling-params]
@@ -2214,6 +2224,10 @@ class TranscriptionRequest(OpenAIBaseModel):
 class TranscriptionResponse(OpenAIBaseModel):
     text: str
     """The transcribed text."""
+    uncertainty: Optional[list[float]] = None
+    """Uncertainty scores for the transcription, if available."""
+    step_sizes: Optional[list[int]] = None
+    """Step sizes for the transcription, if available."""
 
 
 class TranscriptionWord(OpenAIBaseModel):
