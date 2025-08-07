@@ -73,21 +73,6 @@ async def test_beam_search_transcription(mary_had_lamb, model_name):
     with RemoteOpenAIServer(model_name, server_args) as remote_server:
         client = remote_server.get_async_client()
 
-        # Test with beam search enabled
-        transcription_beam = await client.audio.transcriptions.create(
-            model=model_name,
-            file=mary_had_lamb,
-            language="en",
-            response_format="text",
-            temperature=0.0,
-            extra_body={
-                "use_beam_search": True,
-                "beam_size": 5
-            })
-        out_beam = json.loads(transcription_beam)['text']
-
-        # Test without beam search for comparison
-        mary_had_lamb.seek(0)  # Reset file pointer
         transcription_regular = await client.audio.transcriptions.create(
             model=model_name,
             file=mary_had_lamb,
@@ -96,6 +81,30 @@ async def test_beam_search_transcription(mary_had_lamb, model_name):
             temperature=0.0,
             extra_body={"use_beam_search": False})
         out_regular = json.loads(transcription_regular)['text']
+        # uncertainty_scores_regular = json.loads(
+        #     transcription_regular)['uncertainty']
+        step_sizes_regular = json.loads(transcription_regular)['step_sizes']
+
+        print("Step sizes (regular):", step_sizes_regular)
+
+        # Test with beam search enabled
+        mary_had_lamb.seek(0)  # Reset file pointer
+        transcription_beam = await client.audio.transcriptions.create(
+            model=model_name,
+            file=mary_had_lamb,
+            language="en",
+            response_format="text",
+            temperature=0.0,
+            extra_body={
+                "use_beam_search": True,
+                "beam_size": 5,
+                "step_sizes": step_sizes_regular
+            })
+        out_beam = json.loads(transcription_beam)['text']
+        # uncertainty_scores = json.loads(transcription_beam)['uncertainty']
+        # step_sizes = json.loads(transcription_beam)['step_sizes']
+
+        # Test without beam search for comparison
 
         # Both should contain the expected text
         assert "Mary had a little lamb," in out_beam
