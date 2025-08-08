@@ -795,15 +795,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Prepare encoder attention metadata separately
         # (encoder layers are not in KV cache groups)
-        if self.is_encoder_only_model or (
-                self.model_config.is_encoder_decoder
-                and scheduler_output.scheduled_encoder_inputs):
-            if self.is_encoder_only_model:
-                common_attn_metadata, encoder_attn_metadata = \
+        if self.is_encoder_only_model:
+            common_attn_metadata, encoder_attn_metadata = \
                     self._build_encoder_only_attn_metadata(
                     scheduler_output)
-            else:
-                common_attn_metadata, encoder_attn_metadata = \
+        elif self.model_config.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
+             common_attn_metadata, encoder_attn_metadata = \
                     self._build_enc_dec_attn_metadata(
                     scheduler_output)
 
