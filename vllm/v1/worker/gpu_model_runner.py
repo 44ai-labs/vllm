@@ -799,8 +799,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             common_attn_metadata, encoder_attn_metadata = \
                     self._build_encoder_only_attn_metadata(
                     scheduler_output)
-        elif self.model_config.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
-             common_attn_metadata, encoder_attn_metadata = \
+        elif (self.model_config.is_encoder_decoder
+              and scheduler_output.scheduled_encoder_inputs):
+            common_attn_metadata, encoder_attn_metadata = \
                     self._build_enc_dec_attn_metadata(
                     scheduler_output)
 
