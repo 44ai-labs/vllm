@@ -866,11 +866,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         builder,
                     )
 
-                attn_metadata_i = (encoder_attn_metadata
-                                   if is_enc_dec else builder.build(
-                                       common_prefix_len=common_prefix_len,
-                                       common_attn_metadata=common_attn_metadata,
-                                   ))
+                attn_metadata_i = (
+                    encoder_attn_metadata if is_enc_dec else builder.build(
+                        common_prefix_len=common_prefix_len,
+                        common_attn_metadata=common_attn_metadata,
+                    ))
 
                 fast_prefill_metadata = attn_metadata_i
                 if (self.cache_config.kv_sharing_fast_prefill
@@ -3247,7 +3247,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 cross_slot_mapping, dtype=torch.int64, device=self.device)
 
         # Use the first attention metadata builder
-        builder = self.attn_metadata_builders[0]
+        builder = self.attn_groups[0][0].metadata_builder
         return common_metadata, builder.build(
             common_prefix_len=0,  # No cascade for encoder
             common_attn_metadata=common_metadata,
