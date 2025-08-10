@@ -70,7 +70,9 @@ async def test_basic_audio(mary_had_lamb, model_name):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model_name", ["mistralai/Voxtral-Mini-3B-2507"])
+@pytest.mark.parametrize(
+    "model_name",
+    ["openai/whisper-large-v3", "mistralai/Voxtral-Mini-3B-2507"])
 async def test_beam_search_transcription(audio_44ai, model_name):
     """Test beam search functionality for transcription."""
     server_args = ["--enforce-eager"]
