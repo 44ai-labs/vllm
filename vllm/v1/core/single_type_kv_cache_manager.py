@@ -567,15 +567,25 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
     def save_new_computed_blocks(
             self, request_id: str,
             new_computed_blocks: list[KVCacheBlock]) -> None:
-        # We do not allocate blocks as decoder tokens are generated, so this
-        # method is not relevant.
-        pass
+        """Record newly computed encoder blocks for a request.
+
+        Cross-attention caches behave similarly to standard decoder KV caches
+        once we allow sharing encoder states between requests.  Newly computed
+        blocks need to be tracked so that they can later be cached in the
+        ``BlockPool`` for prefix re-use.
+        """
+        super().save_new_computed_blocks(request_id, new_computed_blocks)
 
     def cache_blocks(self, request: Request, block_hashes: list[BlockHash],
                      num_tokens: int) -> None:
-        # We do not cache blocks for cross-attention to be shared between
-        # requests, so this method is not relevant.
-        pass
+        """Cache encoder blocks so that they can be reused by future requests.
+
+        When the same audio (or other encoder input) is used multiple times,
+        caching the encoder states avoids recomputation.  This simply delegates
+        to the base implementation which inserts the blocks into the
+        ``BlockPool``'s cache.
+        """
+        super().cache_blocks(request, block_hashes, num_tokens)
 
     def get_num_common_prefix_blocks(self, request_id: str,
                                      num_running_requests: int) -> int:
@@ -596,13 +606,32 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         assert isinstance(kv_cache_spec, CrossAttentionSpec), (
             "CrossAttentionManager can only be used for cross-attention groups"
         )
-        # Cross-attention does not benefit from prefix caching since:
-        # 1. Encoder states are unique per request (different audio/image
-        #    inputs)
-        # 2. Encoder states are computed once per request, not incrementally
-        # 3. No reusable prefix exists between different multimodal inputs
-        # Return empty blocks to indicate no cache hits
-        return tuple([] for _ in range(len(kv_cache_group_ids)))
+
+        # For encoder-decoder models, encoder outputs are static for a given
+        # input.  If the same input appears in multiple requests we can reuse
+        # previously-computed blocks.  The logic is identical to the one used
+        # for full attention: scan the block hashes from left to right and
+        # collect matching cached blocks until a miss occurs or ``max_length``
+        # is reached.
+        computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
+            [] for _ in range(len(kv_cache_group_ids)))
+        max_num_blocks = max_length // kv_cache_spec.block_size
+        for block_hash in itertools.islice(block_hashes, max_num_blocks):
+            if cached_block := block_pool.get_cached_block(block_hash,
+                                                           kv_cache_group_ids):
+                for computed, cached in zip(computed_blocks, cached_block):
+                    computed.append(cached)
+            else:
+                break
+
+        # When using eagle we need to recompute the last block to obtain the
+        # required hidden states for the drafting head, so drop the final
+        # matched block if there was any hit.
+        if use_eagle and computed_blocks[0]:
+            for computed in computed_blocks:
+                computed.pop()
+
+        return computed_blocks
 
     def remove_skipped_blocks(self, request_id: str,
                               num_computed_tokens: int) -> None:
