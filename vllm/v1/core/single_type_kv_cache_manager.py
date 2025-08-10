@@ -98,11 +98,18 @@ class SingleTypeKVCacheManager(ABC):
                 prefix cache.
         """
         if request_id not in self.num_cached_block:
-            # A new request.
+            # A new request. In most cases no blocks should have been
+            # allocated yet. However, some managers (e.g. cross-attention)
+            # may allocate blocks before caching begins. In that case we
+            # simply initialize the cached block count without asserting the
+            # request has no blocks.
             req_blocks = self.req_to_blocks[request_id]
-            assert len(req_blocks) == 0
-            req_blocks.extend(new_computed_blocks)
-            self.num_cached_block[request_id] = len(new_computed_blocks)
+            if new_computed_blocks:
+                assert len(req_blocks) == 0
+                req_blocks.extend(new_computed_blocks)
+                self.num_cached_block[request_id] = len(new_computed_blocks)
+            else:
+                self.num_cached_block[request_id] = 0
         else:
             # A running request. Should not have new computed blocks.
             assert len(new_computed_blocks) == 0
