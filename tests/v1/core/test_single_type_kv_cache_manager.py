@@ -9,9 +9,10 @@ from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (BlockHash, BlockHashWithGroupId,
                                          KVCacheBlock)
 from vllm.v1.core.single_type_kv_cache_manager import (
-    ChunkedLocalAttentionManager, SlidingWindowManager)
+    ChunkedLocalAttentionManager, CrossAttentionManager,
+    SlidingWindowManager)
 from vllm.v1.kv_cache_interface import (ChunkedLocalAttentionSpec,
-                                        SlidingWindowSpec)
+                                        CrossAttentionSpec, SlidingWindowSpec)
 
 
 def get_sliding_window_manager(sliding_window_spec, block_pool):
@@ -302,6 +303,32 @@ def test_get_num_blocks_to_allocate():
                                               cached_blocks_1) == 20
     assert manager.get_num_blocks_to_allocate("2", 20 * block_size,
                                               cached_blocks_2) == 15
+
+
+def test_cross_attention_save_new_computed_blocks_with_preallocation():
+    block_size = 2
+    spec = CrossAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        use_mla=False,
+    )
+
+    block_pool = BlockPool(num_gpu_blocks=10, enable_caching=True)
+    manager = CrossAttentionManager(spec,
+                                    block_pool,
+                                    caching_hash_fn=lambda x: x,
+                                    kv_cache_group_id=0)
+
+    req_id = "req"
+    # Allocate blocks before saving computed blocks (as done for encoder cache)
+    manager.allocate_new_blocks(req_id, 4)
+
+    # Should not raise even though blocks already exist
+    manager.save_new_computed_blocks(req_id, [])
+    assert manager.num_cached_block[req_id] == 0
+    assert len(manager.req_to_blocks[req_id]) == 2
 
 
 def test_chunked_local_attention_get_num_blocks_to_allocate():
