@@ -40,6 +40,7 @@ from vllm.multimodal.processing import (BaseProcessingInfo,
                                         PromptReplacement, PromptUpdate)
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.transformers_utils.processor import cached_get_processor
+from vllm.sequence import IntermediateTensors
 
 from .interfaces import (MultiModalEmbeddings, SupportsMultiModal,
                          SupportsTranscription)
@@ -525,11 +526,17 @@ class WhisperDecoder(nn.Module):
 
     def forward(
         self,
-        input_ids,
+        input_ids: Optional[torch.Tensor],
         positions: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor],
-    ):
-        inputs_embeds = self.get_input_embeddings(input_ids)
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, IntermediateTensors]:
+        if inputs_embeds is None:
+            assert input_ids is not None
+            inputs_embeds = self.get_input_embeddings(input_ids)
+            input_ids = None
+
         positions = self.embed_positions(positions)
         hidden_states = inputs_embeds + positions
 
@@ -563,12 +570,18 @@ class WhisperModel(nn.Module):
         input_features: Optional[Union[torch.Tensor, list[torch.Tensor]]],
         input_ids: Optional[torch.Tensor],
         positions: torch.Tensor,
-    ) -> torch.Tensor:
-        encoder_outputs = self.get_encoder_outputs(input_features)
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, IntermediateTensors]:
+        if encoder_hidden_states is None:
+            encoder_hidden_states = self.get_encoder_outputs(input_features)
         decoder_outputs = self.decoder(
             input_ids=input_ids,
             positions=positions,
-            encoder_hidden_states=encoder_outputs,
+            encoder_hidden_states=encoder_hidden_states,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
         )
         return decoder_outputs
 
@@ -856,13 +869,31 @@ class WhisperForConditionalGeneration(nn.Module, SupportsTranscription,
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        **kwargs,
-    ) -> torch.Tensor:
-        audio_input = self._parse_and_validate_audio_input(**kwargs)
-        decoder_outputs = self.model(
-            input_features=audio_input["input_features"],
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        **kwargs: object,
+    ) -> Union[torch.Tensor, IntermediateTensors]:
+        encoder_hidden_states = kwargs.pop("encoder_hidden_states", None)
+        if intermediate_tensors is not None:
+            inputs_embeds = None
+
+        # NOTE: In v1, inputs_embeds and encoder_hidden_states are generated at
+        # model runner. The below branch is for v0 compatibility.
+        if inputs_embeds is None or encoder_hidden_states is None:
+            audio_input = self._parse_and_validate_audio_input(**kwargs)
+            if encoder_hidden_states is None:
+                encoder_hidden_states = self.model.get_encoder_outputs(
+                    audio_input["input_features"])
+            if inputs_embeds is None:
+                inputs_embeds = self.get_input_embeddings(input_ids)
+                input_ids = None
+
+        decoder_outputs = self.model.decoder(
             input_ids=input_ids,
             positions=positions,
+            encoder_hidden_states=encoder_hidden_states,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
         )
         return decoder_outputs
 
