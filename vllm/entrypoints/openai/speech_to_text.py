@@ -676,6 +676,8 @@ class OpenAISpeechToText(OpenAIServing):
         """
         # Optimization 1: Skip tokenizer loading and assume EOS token ID
         eos_token_id = 2  # Assume EOS token ID is 2
+        if self.model_config.model.startswith("openai/whisper"):
+            eos_token_id = 50257
         print(f"Using assumed EOS token ID: {eos_token_id}")
 
         # Optimization 3: Set logprob threshold to filter out low-probability
@@ -730,21 +732,25 @@ class OpenAISpeechToText(OpenAIServing):
                         continue
 
                     # Validate prompt format
-                    if (not isinstance(prompt, dict)
-                            or "multi_modal_data" not in prompt
-                            or "prompt_token_ids" not in prompt):
+                    if "multi_modal_data" in prompt:
+                        current_prompt = {
+                            "prompt_token_ids":
+                            (prompt["prompt_token_ids"] + beam_tokens),
+                            "multi_modal_data":
+                            prompt.get("multi_modal_data", {})
+                        }
+                    elif "encoder_prompt" in prompt:
+                        print(f"Beam {beam_idx} with text: {beam_text} "
+                              f'({beam_tokens}), {prompt["decoder_prompt"]}')
+                        current_prompt = {
+                            "encoder_prompt": prompt["encoder_prompt"],
+                            "decoder_prompt":
+                            prompt["decoder_prompt"] + beam_text
+                        }
+                    else:
                         raise ValueError(
-                            "Beam search requires prompts to be in dict "
-                            "format with 'prompt_token_ids' and "
-                            "'multi_modal_data'.")
-
-                    # Create current prompt + generated tokens so far
-                    current_prompt = {
-                        "prompt_token_ids":
-                        (prompt["prompt_token_ids"] + beam_tokens),
-                        "multi_modal_data":
-                        prompt.get("multi_modal_data", {})
-                    }
+                            "Beam search not supported for this prompt type. "
+                            f"Prompt: {prompt}")
 
                     # Create sampling params for getting logprobs
                     beam_sampling_params = SamplingParams(

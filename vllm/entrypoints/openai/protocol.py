@@ -2210,12 +2210,16 @@ class TranscriptionRequest(OpenAIBaseModel):
                 "Please set either `use_beam_search=False` or `stream=False`.")
 
         # Validate beam search + V0 engine combination
+        # if use_beam_search and not envs.VLLM_USE_V1:
+        #     raise ValueError(
+        #         "Beam search is not supported in vLLM engine V0 due to lack
+        # of "
+        #         "cache prefix support for encoder-decoder models. "
+        #         "Please set VLLM_USE_V1=1 to use the V1 engine, or set "
+        #         "`use_beam_search=False` to disable beam search.")
         if use_beam_search and not envs.VLLM_USE_V1:
-            raise ValueError(
-                "Beam search is not supported in vLLM engine V0 due to lack of "
-                "cache prefix support for encoder-decoder models. "
-                "Please set VLLM_USE_V1=1 to use the V1 engine, or set "
-                "`use_beam_search=False` to disable beam search.")
+            print(
+                "Warning: Beam search will be very inefficient in V0 engine ")
 
         return data
 

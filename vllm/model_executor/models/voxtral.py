@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from functools import cached_property
 from math import ceil
@@ -456,6 +457,9 @@ class VoxtralForConditionalGeneration(nn.Module, SupportsMultiModal,
                               stt_config: SpeechToTextConfig,
                               language: Optional[str], task_type: str,
                               request_prompt: str) -> PromptType:
+        # TODO: request prompt is ignored
+        print(f"generation prompt for audio: {request_prompt}")
+        start_time = time.time()
         tokenizer = cached_tokenizer_from_config(model_config)
         audio = Audio(audio, int(stt_config.sample_rate),
                       format="wav")  # lossless
@@ -467,6 +471,8 @@ class VoxtralForConditionalGeneration(nn.Module, SupportsMultiModal,
         audio = (tokenized.audios[0].audio_array, stt_config.sample_rate)
         prompts_dict = {"multi_modal_data": {"audio": audio}}
         prompts_dict["prompt_token_ids"] = tokenized.tokens
+        end_time = time.time()
+        print(f"Tokenization took {end_time - start_time:.2f} seconds")
         return cast(PromptType, prompts_dict)
 
     @classmethod
