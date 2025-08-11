@@ -1570,8 +1570,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
-        if (self.is_multimodal_model
-                and not self.model_config.is_encoder_decoder):
+        if (self.is_multimodal_model):
             # Run the multimodal encoder if any.
             self._execute_mm_encoder(scheduler_output)
             mm_embeds = self._gather_mm_embeddings(scheduler_output)
@@ -2309,8 +2308,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         with self.maybe_dummy_run_with_lora(self.lora_config,
                                             num_scheduled_tokens):
-            if (self.is_multimodal_model
-                    and not self.model_config.is_encoder_decoder):
+            if (self.is_multimodal_model):
                 input_ids = None
                 inputs_embeds = self.inputs_embeds[:num_tokens]
                 model_mm_kwargs = self._dummy_mm_kwargs(num_reqs)
@@ -2517,9 +2515,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         return self._dummy_pooler_run_task(hidden_states, max_task)
 
     def profile_run(self) -> None:
-        # Profile with multimodal encoder & encoder cache.
-        if (self.is_multimodal_model
-                and not self.model_config.is_encoder_decoder):
+        # Profile with multimodal encoder & decoder cache.
+        if (self.is_multimodal_model):
             mm_budget = self.mm_budget
             assert mm_budget is not None
 

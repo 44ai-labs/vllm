@@ -652,6 +652,7 @@ class InputPreprocessor:
         self,
         prompt: PromptType,
         tokenization_kwargs: Optional[dict[str, Any]] = None,
+        return_mm_hashes: bool = False,
     ) -> EncoderDecoderInputs:
         """
         For encoder/decoder models only:
@@ -693,11 +694,13 @@ class InputPreprocessor:
             encoder_inputs = self._prompt_to_llm_inputs(
                 prompt["encoder_prompt"],
                 tokenization_kwargs=tokenization_kwargs,
+                return_mm_hashes=return_mm_hashes,
             )
             if (decoder_input := prompt["decoder_prompt"]) is None:
                 decoder_inputs = None
             else:
-                decoder_inputs = self._prompt_to_llm_inputs(decoder_input)
+                decoder_inputs = self._prompt_to_llm_inputs(
+                    decoder_input, return_mm_hashes=return_mm_hashes)
             # For multimodal model, override decoder prompt from processor
             # with explicit decoder prompt.
             if self.model_config.is_multimodal_model:
@@ -708,6 +711,7 @@ class InputPreprocessor:
             inputs = self._prompt_to_llm_inputs(
                 prompt,
                 tokenization_kwargs=tokenization_kwargs,
+                return_mm_hashes=return_mm_hashes,
             )
             if self.model_config.is_multimodal_model:
                 # Encoder-Decoder Multimodal model
@@ -843,8 +847,9 @@ class InputPreprocessor:
         if self.model_config.is_encoder_decoder:
             # Encoder-decoder model requires special mapping of
             # input prompts to encoder & decoder
+            # return mm_hashes?
             return self._process_encoder_decoder_prompt(
-                prompt, tokenization_kwargs)
+                prompt, tokenization_kwargs, return_mm_hashes=return_mm_hashes)
 
         if is_explicit_encoder_decoder_prompt(prompt):
             raise ValueError("Cannot pass encoder-decoder prompt "
