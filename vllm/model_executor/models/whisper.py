@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import hashlib
 import math
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import nullcontext
 from typing import Optional, TypedDict, Union, cast
@@ -572,29 +574,6 @@ class WhisperModel(nn.Module):
         self.decoder = WhisperDecoder(vllm_config=vllm_config,
                                       prefix=f"{prefix}.decoder")
 
-    def forward(
-        self,
-        input_features: Optional[Union[torch.Tensor, list[torch.Tensor]]],
-        input_ids: Optional[torch.Tensor],
-        positions: torch.Tensor,
-    ) -> torch.Tensor:
-        # HERE
-        encoder_outputs = self.get_encoder_outputs(input_features)
-        decoder_outputs = self.decoder(
-            input_ids=input_ids,
-            positions=positions,
-            encoder_hidden_states=encoder_outputs,
-        )
-        return decoder_outputs
-
-    def get_encoder_outputs(
-        self,
-        input_features: Optional[Union[torch.Tensor, list[torch.Tensor]]],
-    ) -> Optional[torch.Tensor]:
-        if input_features is None:
-            return None
-        return self.encoder(input_features)
-
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
@@ -883,6 +862,9 @@ class WhisperForConditionalGeneration(nn.Module, SupportsTranscription,
         self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
                                                 config.vocab_size, logit_scale)
 
+        self._encoder_cache = OrderedDict()
+        self._max_cache_size = 500
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -916,20 +898,73 @@ class WhisperForConditionalGeneration(nn.Module, SupportsTranscription,
     def get_language_model(self) -> torch.nn.Module:
         return self.model.decoder
 
+    # TODO:
+    # 1. check if encoder cache combined with decoder caching works
+    # 2. check if we can use that to speed up other models (namely voxtral)
+    # 3.
     def get_encoder_output(self, **kwargs: object) -> Optional[torch.Tensor]:
-        # v1 runner can call this during prefill so we don’t
+        # v1 runner can call this during prefill so we don't
         # recompute elsewhere.
         audio = self._parse_and_validate_audio_input(**kwargs)
         feats = audio["input_features"]
         if feats is None:
             return None
+
+        # Generate hash-based cache key
+        cache_key = self._generate_cache_key(feats)
+
+        # Check if encoder output is already cached
+        if cache_key in self._encoder_cache:
+            # Move to end (most recently used)
+            self._encoder_cache.move_to_end(cache_key)
+            print(f"Encoder Cache Hit: {cache_key}")
+            return self._encoder_cache[cache_key]
+
         # Encoder outputs are the hidden states after the encoder layers.
         # Shape: (B, T_enc, H)
         if len(feats.shape) == 2:
             # If input features are 2D, we assume they are already batched.
             feats = feats.unsqueeze(0)
         enc = self.model.encoder([feats])
+
+        # Cache the encoder output with LRU eviction
+        self._cache_encoder_output(cache_key, enc)
+
         return enc
+
+    def _generate_cache_key(self, feats: torch.Tensor) -> str:
+        """Generate a hash-based cache key from audio features."""
+        # Convert tensor to bytes for hashing
+        tensor_bytes = feats.detach().cpu().numpy().tobytes()
+        # Create hash from tensor data and shape
+        hash_input = tensor_bytes + str(feats.shape).encode()
+        return hashlib.md5(hash_input).hexdigest()
+
+    def _cache_encoder_output(self, cache_key: str,
+                              encoder_output: torch.Tensor):
+        """Cache encoder output with LRU eviction policy."""
+        # Add/update cache entry
+        self._encoder_cache[cache_key] = encoder_output
+
+        # Move to end (most recently used)
+        self._encoder_cache.move_to_end(cache_key)
+
+        # Evict oldest entries if cache exceeds max size
+        while len(self._encoder_cache) > self._max_cache_size:
+            # Remove least recently used (first item)
+            self._encoder_cache.popitem(last=False)
+
+    def clear_encoder_cache(self):
+        """Clear the encoder output cache."""
+        self._encoder_cache.clear()
+
+    def get_cache_info(self) -> dict:
+        """Get cache statistics."""
+        return {
+            "cache_size": len(self._encoder_cache),
+            "max_cache_size": self._max_cache_size,
+            "cache_keys": list(self._encoder_cache.keys())
+        }
 
     def get_multimodal_embeddings(self,
                                   **kwargs: object) -> MultiModalEmbeddings:

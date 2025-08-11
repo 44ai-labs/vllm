@@ -4907,8 +4907,9 @@ class VllmConfig:
                             new_max_num_batched_tokens)
                 self.scheduler_config.max_num_batched_tokens = \
                     new_max_num_batched_tokens
-            if self.cache_config is not None:
-                self.cache_config.enable_prefix_caching = False
+            # TODO: make better
+            # if self.cache_config is not None:
+            #     self.cache_config.enable_prefix_caching = False
 
         if (self.kv_events_config is not None
                 and self.kv_events_config.enable_kv_cache_events
