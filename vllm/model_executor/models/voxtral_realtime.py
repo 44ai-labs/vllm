@@ -143,6 +143,7 @@ class VoxtralRealtimeBuffer:
         self._streaming_size = self._get_len_in_samples(1000 / self._config.frame_rate)
 
         # mutable objects
+        print(f"STREAMING BUFFER CONFIG: {config}")
         streaming_delay = self._get_len_in_samples(self._config.transcription_delay_ms)
         self._start = 0
         self._end = streaming_delay + self._streaming_size
@@ -305,10 +306,23 @@ class VoxtralRealtimeGeneration(VoxtralForConditionalGeneration, SupportsRealtim
         # for realtime we simply flatten the multimodal embeddings
         # to be in tensor format, we treat the input ids later
         assert multimodal_embeddings is not None
-        assert len(multimodal_embeddings) > 0, (
-            "For realtime you must provide a multimodal_embedding at every step."
-        )
-        mm_embeds_flat = _flatten_embeddings(multimodal_embeddings)
+        assert is_multimodal is not None
+        
+        # Insert zero embeddings for positions where is_multimodal is False
+        embed_size = 5120
+        mm_embeds_flat = None
+        if len(multimodal_embeddings) > 0:
+            mm_embeds_flat = _flatten_embeddings(multimodal_embeddings)
+        
+        if mm_embeds_flat is None or is_multimodal.shape[0] != mm_embeds_flat.shape[0]:
+            # some are zero (False in is_multimodal)
+            full_embeddings = torch.zeros((len(input_ids), embed_size), device=input_ids.device, dtype=mm_embeds_flat.dtype if mm_embeds_flat is not None else torch.bfloat16)
+            if mm_embeds_flat is not None:
+                full_embeddings[is_multimodal] = mm_embeds_flat
+            mm_embeds_flat = full_embeddings
+        
+        assert mm_embeds_flat is not None, "Multimodal embeddings should not be None at this point"
+
         return mm_embeds_flat
 
     def forward(
@@ -319,13 +333,14 @@ class VoxtralRealtimeGeneration(VoxtralForConditionalGeneration, SupportsRealtim
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
+        # t0 = time.perf_counter()
         assert inputs_embeds is not None
         assert input_ids is not None
 
         pool_size = self.config.audio_config.block_pool_size
-        inputs_embeds = inputs_embeds.view(
+        inputs_embeds = inputs_embeds.reshape(
             inputs_embeds.shape[0] * pool_size, inputs_embeds.shape[1] // pool_size
-        )
+        ).clone()
 
         whisper_positions = _expand_tensor(positions, pool_size)
         audio_hidden_states = self.whisper_encoder.whisper_encoder(
@@ -455,11 +470,12 @@ class VoxtralRealtimeGeneration(VoxtralForConditionalGeneration, SupportsRealtim
             streaming=StreamingMode.OFFLINE,
         )
 
-        tokenized = tokenizer.instruct.encode_transcription(req)
+        tokenized = tokenizer.mistral.encode_transcription(req)
+        new_audio = tokenized.audios[0].audio_array
 
         return TokensPrompt(
             prompt_token_ids=tokenized.tokens,
             multi_modal_data={
-                "audio": (tokenized.audios[0].audio_array, stt_config.sample_rate)
+                "audio": (new_audio, stt_config.sample_rate)
             },
         )
