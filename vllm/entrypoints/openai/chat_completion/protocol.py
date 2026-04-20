@@ -92,6 +92,7 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     # not part of the OpenAI spec but is useful for tracing the tokens
     # in agent scenarios
     token_ids: list[int] | None = None
+    token_texts: list[str] | None = None
     routed_experts: list[list[list[int]]] | None = None  # [gen_len, num_layers, top_k]
 
 
@@ -127,6 +128,7 @@ class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
     stop_reason: int | str | None = None
     # not part of the OpenAI spec but for tracing the tokens
     token_ids: list[int] | None = None
+    token_texts: list[str] | None = None
 
 
 class ChatCompletionStreamResponse(OpenAIBaseModel):
@@ -367,6 +369,18 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "exactly what was fed into the model."
         ),
     )
+    return_token_texts: bool | None = Field(
+        default=None,
+        description=(
+            "If specified, the result will include per-token detokenized "
+            "strings produced by contextual incremental detokenization. "
+            "Each entry corresponds to one token and represents its text "
+            "contribution to the generated output. "
+            "Invariant: ''.join(token_texts) == delta.content (streaming) "
+            "or ''.join(token_texts) == message.content (non-streaming). "
+            "len(token_texts) == len(token_ids) when both are requested."
+        ),
+    )
 
     cache_salt: str | None = Field(
         default=None,
@@ -605,6 +619,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             output_kind=RequestOutputKind.DELTA
             if self.stream
             else RequestOutputKind.FINAL_ONLY,
+            return_token_texts=bool(self.return_token_texts),
             structured_outputs=self.structured_outputs,
             logit_bias=self.logit_bias,
             bad_words=self.bad_words,
