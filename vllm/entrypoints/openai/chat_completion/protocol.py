@@ -121,6 +121,7 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     # ``None`` if (a) the request was aborted before any forward pass,
     # or (b) ``enable_return_routed_experts`` is off server-side.
     routed_experts: str | None = None
+    token_texts: list[str] | None = None
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
@@ -160,6 +161,7 @@ class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
     stop_reason: int | str | None = None
     # not part of the OpenAI spec but for tracing the tokens
     token_ids: list[int] | None = None
+    token_texts: list[str] | None = None
 
 
 class ChatCompletionStreamResponse(OpenAIBaseModel):
@@ -435,6 +437,18 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "prompt string produced by chat templating. In streaming mode it "
             "is sent only on the first chunk. This is useful for inspecting "
             "exactly what was fed into the model."
+        ),
+    )
+    return_token_texts: bool | None = Field(
+        default=None,
+        description=(
+            "If specified, the result includes per-token detokenized strings "
+            "(one entry per generated token) from contextual incremental "
+            "detokenization. Like token_ids and logprobs, this is the complete "
+            "raw per-token trace: it covers every generated token (reasoning, "
+            "tool-call, and content tokens) and is not filtered into the "
+            "curated content/reasoning_content/tool_calls views. "
+            "len(token_texts) == len(token_ids) when both are requested."
         ),
     )
 
@@ -723,6 +737,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 RequestOutputKind.DELTA if self.stream else RequestOutputKind.FINAL_ONLY
             ),
             stream_interval=self.stream_interval,
+            return_token_texts=bool(self.return_token_texts),
             structured_outputs=self.extract_structured_outputs(),
             logit_bias=self.logit_bias,
             bad_words=self.bad_words,

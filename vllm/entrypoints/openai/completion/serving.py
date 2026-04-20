@@ -418,6 +418,11 @@ class OpenAIServingCompletion(GenerateBaseServing):
                                     if request.return_token_ids
                                     else None
                                 ),
+                                token_texts=(
+                                    output.token_texts
+                                    if request.return_token_texts
+                                    else None
+                                ),
                             )
                         ],
                     )
@@ -591,6 +596,9 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     ),
                     token_ids=(
                         as_list(output.token_ids) if request.return_token_ids else None
+                    ),
+                    token_texts=(
+                        output.token_texts if request.return_token_texts else None
                     ),
                     routed_experts=routed_experts_b64,
                 )
