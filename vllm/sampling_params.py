@@ -304,6 +304,10 @@ class SamplingParams(
     `RequestOutput`. Raises the interval above the engine-level
     `--stream-interval`. Values below engine setting are clamped up to it.
     The first and final outputs are always emitted immediately."""
+    return_token_texts: bool = False
+    """Whether to return per-token detokenized strings alongside generated
+    text.  When True the detokenizer accumulates the individual
+    ``decode_next()`` results so they can be surfaced in the response."""
     skip_clone: bool = False
     """Internal flag indicating that this SamplingParams instance is safe to
     reuse without cloning. When True, clone() will return self without
@@ -383,6 +387,7 @@ class SamplingParams(
         spaces_between_special_tokens: bool = True,
         output_kind: RequestOutputKind = RequestOutputKind.CUMULATIVE,
         stream_interval: int | None = None,
+        return_token_texts: bool = False,
         structured_outputs: StructuredOutputsParams | None = None,
         logit_bias: dict[int, float] | dict[str, float] | None = None,
         allowed_token_ids: list[int] | None = None,
@@ -446,6 +451,7 @@ class SamplingParams(
             spaces_between_special_tokens=spaces_between_special_tokens,
             output_kind=output_kind,
             stream_interval=stream_interval,
+            return_token_texts=return_token_texts,
             structured_outputs=structured_outputs,
             logit_bias=logit_bias,
             allowed_token_ids=allowed_token_ids,
