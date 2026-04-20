@@ -387,6 +387,7 @@ class RequestState:
 
         # Prepare text and token_ids, based on delta mode
         text = self.detokenizer.get_next_output_text(finished, delta)
+        token_texts = self.detokenizer.get_next_token_texts(delta)
         if not delta:
             token_ids = self.detokenizer.output_token_ids
 
@@ -399,6 +400,7 @@ class RequestState:
             index=self.request_index,
             text=text,
             token_ids=token_ids,
+            token_texts=token_texts,
             routed_experts=routed_experts,
             logprobs=logprobs,
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
