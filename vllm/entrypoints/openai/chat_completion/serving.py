@@ -1027,12 +1027,14 @@ class OpenAIServingChat(OpenAIServing):
                     # wasn't ready to send a token, then
                     #   get the next token without streaming a chunk
                     if delta_message is None:
-                        # NOTE: If return_token_ids is enabled, we still need to
-                        # send a chunk with token_ids even if delta_message is None
-                        # to ensure all tokens are included in the response
+                        # NOTE: If return_token_ids or return_token_texts is
+                        # enabled, we still need to send a chunk even if
+                        # delta_message is None to ensure all tokens are
+                        # included in the response.
                         if (
                             output.finish_reason is None
                             and not request.return_token_ids
+                            and not request.return_token_texts
                         ):
                             continue
                         delta_message = DeltaMessage()
@@ -1075,6 +1077,11 @@ class OpenAIServingChat(OpenAIServing):
                             token_ids=(
                                 as_list(output.token_ids)
                                 if request.return_token_ids
+                                else None
+                            ),
+                            token_texts=(
+                                output.token_texts
+                                if request.return_token_texts
                                 else None
                             ),
                         )
@@ -1175,6 +1182,11 @@ class OpenAIServingChat(OpenAIServing):
                             token_ids=(
                                 as_list(output.token_ids)
                                 if request.return_token_ids
+                                else None
+                            ),
+                            token_texts=(
+                                output.token_texts
+                                if request.return_token_texts
                                 else None
                             ),
                         )
@@ -1366,6 +1378,9 @@ class OpenAIServingChat(OpenAIServing):
                     stop_reason=output.stop_reason,
                     token_ids=(
                         as_list(output.token_ids) if request.return_token_ids else None
+                    ),
+                    token_texts=(
+                        output.token_texts if request.return_token_texts else None
                     ),
                 )
                 choices.append(choice_data)
@@ -1565,6 +1580,9 @@ class OpenAIServingChat(OpenAIServing):
                 stop_reason=output.stop_reason,
                 token_ids=(
                     as_list(output.token_ids) if request.return_token_ids else None
+                ),
+                token_texts=(
+                    output.token_texts if request.return_token_texts else None
                 ),
             )
             choice_data = maybe_filter_parallel_tool_calls(choice_data, request)

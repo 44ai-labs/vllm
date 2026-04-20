@@ -398,6 +398,11 @@ class OpenAIServingCompletion(OpenAIServing):
                                     if request.return_token_ids
                                     else None
                                 ),
+                                token_texts=(
+                                    output.token_texts
+                                    if request.return_token_texts
+                                    else None
+                                ),
                             )
                         ],
                     )
@@ -530,6 +535,9 @@ class OpenAIServingCompletion(OpenAIServing):
                     ),
                     token_ids=(
                         as_list(output.token_ids) if request.return_token_ids else None
+                    ),
+                    token_texts=(
+                        output.token_texts if request.return_token_texts else None
                     ),
                 )
                 choices.append(choice_data)
