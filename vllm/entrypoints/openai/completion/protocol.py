@@ -141,6 +141,18 @@ class CompletionRequest(OpenAIBaseModel):
             "need to map generated text back to input tokens."
         ),
     )
+    return_token_texts: bool | None = Field(
+        default=None,
+        description=(
+            "If specified, the result includes per-token detokenized strings "
+            "(one entry per generated token) from contextual incremental "
+            "detokenization. Like token_ids and logprobs, this is the complete "
+            "raw per-token trace: it covers every generated token (including "
+            "reasoning tokens) and is not filtered into the curated "
+            "text/reasoning views. "
+            "len(token_texts) == len(token_ids) when both are requested."
+        ),
+    )
 
     cache_salt: str | None = Field(
         default=None,
@@ -316,6 +328,7 @@ class CompletionRequest(OpenAIBaseModel):
             output_kind=RequestOutputKind.DELTA
             if self.stream
             else RequestOutputKind.FINAL_ONLY,
+            return_token_texts=bool(self.return_token_texts),
             structured_outputs=self.structured_outputs,
             logit_bias=self.logit_bias,
             allowed_token_ids=self.allowed_token_ids,
@@ -466,6 +479,7 @@ class CompletionResponseChoice(OpenAIBaseModel):
         ),
     )
     token_ids: list[int] | None = None  # For response
+    token_texts: list[str] | None = None
     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
     prompt_token_ids: list[int] | None = None  # For prompt
     routed_experts: list[list[list[int]]] | None = None  # [gen_len, num_layers, top_k]
@@ -507,6 +521,7 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
     # prompt tokens is put into choice to align with CompletionResponseChoice
     prompt_token_ids: list[int] | None = None
     token_ids: list[int] | None = None
+    token_texts: list[str] | None = None
 
 
 class CompletionStreamResponse(OpenAIBaseModel):
