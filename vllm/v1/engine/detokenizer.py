@@ -45,6 +45,17 @@ class IncrementalDetokenizer:
     def get_next_output_text(self, finished: bool, delta: bool) -> str:
         return ""
 
+    def get_next_token_texts(self, delta: bool) -> list[str] | None:
+        """Return per-token detokenized strings.
+
+        When delta is True, returns only texts for tokens produced since the
+        last call.  Each entry is the contextually-detokenized contribution of
+        one token; ''.join(result) == the corresponding delta text.
+
+        Returns None when detokenization is disabled (no tokenizer).
+        """
+        return None
+
     @classmethod
     def from_new_request(
         cls,
@@ -92,6 +103,15 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
         # Generation data
         self.output_text = ""
 
+        # Per-token detokenized text tracking (opt-in).
+        self.return_token_texts = (
+            request.sampling_params.return_token_texts
+            if request.sampling_params is not None
+            else False
+        )
+        self.incremental_token_texts: list[str] = []
+        self.last_token_texts_offset: int = 0
+
     def update(self, new_token_ids: list[int], stop_terminated: bool) -> str | None:
         """
         Update RequestState for the request_id by:
@@ -116,7 +136,10 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
         stop_check_offset = len(self.output_text)
         for new_token_id in new_token_ids:
             self.token_ids.append(new_token_id)
-            self.output_text += self.decode_next(new_token_id)
+            decoded = self.decode_next(new_token_id)
+            self.output_text += decoded
+            if self.return_token_texts:
+                self.incremental_token_texts.append(decoded)
             # Support min_tokens, see https://github.com/vllm-project/vllm/pull/22014
             if self.min_tokens and self.num_output_tokens() <= self.min_tokens:
                 stop_check_offset = len(self.output_text)
@@ -162,6 +185,15 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
             self._last_output_text_offset = length
             return self.output_text[last_offset:length]
         return ""
+
+    def get_next_token_texts(self, delta: bool) -> list[str] | None:
+        if not self.return_token_texts:
+            return None
+        if not delta:
+            return list(self.incremental_token_texts)
+        last_offset = self.last_token_texts_offset
+        self.last_token_texts_offset = len(self.incremental_token_texts)
+        return list(self.incremental_token_texts[last_offset:])
 
 
 class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
