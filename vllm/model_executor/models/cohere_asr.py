@@ -24,6 +24,7 @@ from vllm.model_executor.layers.attention import (
 )
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
@@ -61,6 +62,7 @@ from vllm.v1.attention.backend import (
 
 from .interfaces import (
     MultiModalEmbeddings,
+    SupportsLoRA,
     SupportsMultiModal,
     SupportsTranscription,
 )
@@ -228,11 +230,9 @@ class CohereASRCrossAttention(CohereASRAttention):
             quant_config=quant_config,
             prefix=f"{prefix}.q_proj",
         )
-        self.kv_proj = QKVParallelLinear(
-            hidden_size=embed_dim,
-            head_size=self.head_dim,
-            total_num_heads=0,
-            total_num_kv_heads=self.total_num_heads,
+        self.kv_proj = MergedColumnParallelLinear(
+            input_size=embed_dim,
+            output_sizes=[embed_dim, embed_dim],
             bias=bias,
             quant_config=quant_config,
             prefix=f"{prefix}.kv_proj",
@@ -1774,8 +1774,8 @@ class CohereASRModel(nn.Module):
             (".first_sub_layer.qkv_proj", ".first_sub_layer.query_net", "q"),
             (".first_sub_layer.qkv_proj", ".first_sub_layer.key_net", "k"),
             (".first_sub_layer.qkv_proj", ".first_sub_layer.value_net", "v"),
-            (".second_sub_layer.kv_proj", ".second_sub_layer.key_net", "k"),
-            (".second_sub_layer.kv_proj", ".second_sub_layer.value_net", "v"),
+            (".second_sub_layer.kv_proj", ".second_sub_layer.key_net", 0),
+            (".second_sub_layer.kv_proj", ".second_sub_layer.value_net", 1),
         ]
         params_dict = dict(self.named_parameters())
         buffers_dict = dict(self.named_buffers())
@@ -1991,7 +1991,7 @@ class CohereASRMultiModalProcessor(EncDecMultiModalProcessor[CohereASRProcessing
     dummy_inputs=CohereASRDummyInputsBuilder,
 )
 class CohereAsrForConditionalGeneration(
-    nn.Module, SupportsTranscription, SupportsMultiModal
+    nn.Module, SupportsTranscription, SupportsMultiModal, SupportsLoRA
 ):
     packed_modules_mapping = {
         "self_attn.qkv_proj": [
