@@ -9,6 +9,7 @@ import torch.cuda
 from vllm.model_executor.models import (
     is_pooling_model,
     is_text_generation_model,
+    supports_lora,
     supports_multimodal,
 )
 from vllm.model_executor.models.adapters import (
@@ -136,3 +137,17 @@ def test_hf_registry_coverage():
         "Please add the following architectures to "
         f"`tests/models/registry.py`: {untested_archs}"
     )
+
+
+@create_new_process_for_each_test()
+@pytest.mark.parametrize(
+    "model_arch",
+    [
+        "CohereAsrForConditionalGeneration",
+        "WhisperForConditionalGeneration",
+    ],
+)
+def test_registry_supports_lora_for_speech_to_text(model_arch):
+    model_cls = ModelRegistry._try_load_model_cls(model_arch)
+    assert model_cls is not None
+    assert supports_lora(model_cls)
