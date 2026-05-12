@@ -26,6 +26,7 @@ from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -797,13 +798,26 @@ class ConformerFeedForward(nn.Module):
         d_ff: int,
         activation: nn.Module | None = None,
         use_bias: bool = True,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         if activation is None:
             activation = Swish()
-        self.linear1 = nn.Linear(d_model, d_ff, bias=use_bias)
+        self.linear1 = ReplicatedLinear(
+            input_size=d_model,
+            output_size=d_ff,
+            bias=use_bias,
+            prefix=f"{prefix}.linear1",
+            return_bias=False,
+        )
         self.activation = activation
-        self.linear2 = nn.Linear(d_ff, d_model, bias=use_bias)
+        self.linear2 = ReplicatedLinear(
+            input_size=d_ff,
+            output_size=d_model,
+            bias=use_bias,
+            prefix=f"{prefix}.linear2",
+            return_bias=False,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.linear1(x)
@@ -982,6 +996,7 @@ class CohereASRMultiHeadAttention(nn.Module):
         n_head: int,
         n_feat: int,
         use_bias: bool = True,
+        prefix: str = "",
     ) -> None:
         """Construct an MultiHeadedAttention object."""
         super().__init__()
@@ -990,10 +1005,34 @@ class CohereASRMultiHeadAttention(nn.Module):
         self.d_k = n_feat // n_head
         self.s_d_k = math.sqrt(self.d_k)
         self.h = n_head
-        self.linear_q = nn.Linear(n_feat, n_feat, bias=use_bias)
-        self.linear_k = nn.Linear(n_feat, n_feat, bias=use_bias)
-        self.linear_v = nn.Linear(n_feat, n_feat, bias=use_bias)
-        self.linear_out = nn.Linear(n_feat, n_feat, bias=use_bias)
+        self.q_proj = ReplicatedLinear(
+            input_size=n_feat,
+            output_size=n_feat,
+            bias=use_bias,
+            prefix=f"{prefix}.q_proj",
+            return_bias=False,
+        )
+        self.k_proj = ReplicatedLinear(
+            input_size=n_feat,
+            output_size=n_feat,
+            bias=use_bias,
+            prefix=f"{prefix}.k_proj",
+            return_bias=False,
+        )
+        self.v_proj = ReplicatedLinear(
+            input_size=n_feat,
+            output_size=n_feat,
+            bias=use_bias,
+            prefix=f"{prefix}.v_proj",
+            return_bias=False,
+        )
+        self.o_proj = ReplicatedLinear(
+            input_size=n_feat,
+            output_size=n_feat,
+            bias=use_bias,
+            prefix=f"{prefix}.o_proj",
+            return_bias=False,
+        )
 
     def forward_qkv(
         self,
@@ -1012,9 +1051,9 @@ class CohereASRMultiHeadAttention(nn.Module):
             v (torch.Tensor): (batch, head, time2, size)
         """
         n_batch = query.size(0)
-        q = self.linear_q(query).view(n_batch, -1, self.h, self.d_k)
-        k = self.linear_k(key).view(n_batch, -1, self.h, self.d_k)
-        v = self.linear_v(value).view(n_batch, -1, self.h, self.d_k)
+        q = self.q_proj(query).view(n_batch, -1, self.h, self.d_k)
+        k = self.k_proj(key).view(n_batch, -1, self.h, self.d_k)
+        v = self.v_proj(value).view(n_batch, -1, self.h, self.d_k)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
@@ -1052,7 +1091,7 @@ class CohereASRMultiHeadAttention(nn.Module):
             n_batch, -1, self.h * self.d_k
         )  # (batch, time1, d_model)
 
-        return self.linear_out(x)  # (batch, time1, d_model)
+        return self.o_proj(x)  # (batch, time1, d_model)
 
     def forward(
         self,
@@ -1098,12 +1137,14 @@ class RelPositionMultiHeadAttention(CohereASRMultiHeadAttention):
         pos_bias_u: nn.Parameter | torch.Tensor | None,
         pos_bias_v: nn.Parameter | torch.Tensor | None,
         use_bias: bool = True,
+        prefix: str = "",
     ) -> None:
         """Construct an RelPositionMultiHeadedAttention object."""
         super().__init__(
             n_head=n_head,
             n_feat=n_feat,
             use_bias=use_bias,
+            prefix=prefix,
         )
         # linear transformation for positional encoding
         self.linear_pos = nn.Linear(n_feat, n_feat, bias=False)
@@ -1218,6 +1259,7 @@ class ConformerLayer(torch.nn.Module):
         pos_bias_v: nn.Parameter | torch.Tensor | None = None,
         att_context_size: list[int] | None = None,
         use_bias: bool = True,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         if att_context_size is None:
@@ -1229,7 +1271,10 @@ class ConformerLayer(torch.nn.Module):
         # first feed forward module
         self.norm_feed_forward1 = nn.LayerNorm(d_model)
         self.feed_forward1 = ConformerFeedForward(
-            d_model=d_model, d_ff=d_ff, use_bias=use_bias
+            d_model=d_model,
+            d_ff=d_ff,
+            use_bias=use_bias,
+            prefix=f"{prefix}.feed_forward1",
         )
 
         # convolution module
@@ -1253,12 +1298,16 @@ class ConformerLayer(torch.nn.Module):
             pos_bias_u=pos_bias_u,
             pos_bias_v=pos_bias_v,
             use_bias=use_bias,
+            prefix=f"{prefix}.self_attn",
         )
 
         # second feed forward module
         self.norm_feed_forward2 = nn.LayerNorm(d_model)
         self.feed_forward2 = ConformerFeedForward(
-            d_model=d_model, d_ff=d_ff, use_bias=use_bias
+            d_model=d_model,
+            d_ff=d_ff,
+            use_bias=use_bias,
+            prefix=f"{prefix}.feed_forward2",
         )
 
         self.norm_out = nn.LayerNorm(d_model)
@@ -1445,6 +1494,7 @@ class ConformerEncoder(nn.Module):
                 pos_bias_v=pos_bias_v,
                 att_context_size=self.att_context_size,
                 use_bias=use_bias,
+                prefix=f"encoder.layers.{i}",
             )
             self.layers.append(layer)
 
@@ -1995,12 +2045,12 @@ class CohereAsrForConditionalGeneration(
     nn.Module, SupportsTranscription, SupportsMultiModal, SupportsLoRA
 ):
     packed_modules_mapping = {
-        "self_attn.qkv_proj": [
-            "self_attn.q_proj",
-            "self_attn.k_proj",
-            "self_attn.v_proj",
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
         ],
-        "encoder_attn.kv_proj": ["encoder_attn.k_proj", "encoder_attn.v_proj"],
+        "kv_proj": ["k_proj", "v_proj"],
     }
 
     hf_to_vllm_mapper = WeightsMapper(
@@ -2246,6 +2296,14 @@ class CohereAsrForConditionalGeneration(
                 name = name.replace("transf_decoder._decoder", "decoder")
             if name.startswith("transf_decoder._embedding"):
                 name = name.replace("transf_decoder._embedding", "decoder.embedding")
+            if ".self_attn.linear_q" in name:
+                name = name.replace(".self_attn.linear_q", ".self_attn.q_proj")
+            if ".self_attn.linear_k" in name:
+                name = name.replace(".self_attn.linear_k", ".self_attn.k_proj")
+            if ".self_attn.linear_v" in name:
+                name = name.replace(".self_attn.linear_v", ".self_attn.v_proj")
+            if ".self_attn.linear_out" in name:
+                name = name.replace(".self_attn.linear_out", ".self_attn.o_proj")
             if "second_sub_layer.query_net" in name:
                 name = name.replace(
                     "second_sub_layer.query_net", "second_sub_layer.q_proj"
