@@ -26,6 +26,18 @@ LORA_WEIGHT_SUFFIXES = (
 MAPPING_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(
+            r"(?:^|.*\.)proj_out(\.lora_(?:A|B)\.weight)$"
+        ),
+        r"lm_head\1",
+    ),
+    (
+        re.compile(
+            r"(?:^|.*\.)log_softmax\.mlp\.layer0(\.lora_(?:A|B)\.weight)$"
+        ),
+        r"lm_head\1",
+    ),
+    (
+        re.compile(
             r"(^|.*\.)transf_decoder\._decoder\.layers\.(\d+)"
             r"\.first_sub_layer\.query_net(\.lora_(?:A|B)\.weight)$"
         ),

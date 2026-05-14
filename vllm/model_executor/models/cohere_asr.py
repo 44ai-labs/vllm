@@ -2053,6 +2053,10 @@ class CohereAsrForConditionalGeneration(
         "kv_proj": ["k_proj", "v_proj"],
     }
 
+    embedding_modules = {
+        "lm_head": "output_embeddings",
+    }
+
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_substr={".fc1.": ".mlp.fc1.", ".fc2.": ".mlp.fc2."}
     )
@@ -2211,12 +2215,14 @@ class CohereAsrForConditionalGeneration(
 
         head_config = config.head
 
-        self.proj_out = ParallelLMHead(
+        self.lm_head = ParallelLMHead(
             head_config["num_classes"],
             head_config["hidden_size"],
             quant_config=quant_config,
             bias=True,
+            prefix=maybe_prefix(prefix, "lm_head"),
         )  # NOTE: bias is True
+        self.proj_out = self.lm_head
 
         logit_scale = getattr(head_config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(
@@ -2285,7 +2291,7 @@ class CohereAsrForConditionalGeneration(
         return input_features, seq_lens
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        logits = self.logits_processor(self.proj_out, hidden_states, self.proj_out.bias)
+        logits = self.logits_processor(self.lm_head, hidden_states, self.lm_head.bias)
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -2310,7 +2316,7 @@ class CohereAsrForConditionalGeneration(
                 )
 
             if name in ["log_softmax.mlp.layer0.weight", "log_softmax.mlp.layer0.bias"]:
-                name = name.replace("log_softmax.mlp.layer0", "proj_out")
+                name = name.replace("log_softmax.mlp.layer0", "lm_head")
             else:
                 name = "model." + name
 
