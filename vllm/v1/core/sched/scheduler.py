@@ -1446,8 +1446,14 @@ class Scheduler(SchedulerInterface):
                         if new_logprobs is not None:
                             n = len(ff_tokens)
                             width = new_logprobs.logprob_token_ids.shape[1]
-                            ff_token_ids = np.zeros(
+                            # Columns 1.. use -1 as an invalid-token-id
+                            # sentinel so the downstream dict[token_id, ...]
+                            # build does not produce a spurious {0: -inf}
+                            # entry (or, worse, overwrite the column 0
+                            # logprob if the forced token itself is 0).
+                            ff_token_ids = np.full(
                                 (n, width),
+                                -1,
                                 dtype=new_logprobs.logprob_token_ids.dtype,
                             )
                             ff_token_ids[:, 0] = ff_tokens

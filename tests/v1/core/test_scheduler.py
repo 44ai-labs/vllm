@@ -4515,8 +4515,10 @@ def test_jump_forward_tokens_logprobs():
     np.testing.assert_allclose(lp.logprobs[0, 0], -0.5)
 
     # ff_token rows: column 0 holds the deterministic token with logprob 0.0.
-    # Columns 1+ have -inf (no real alternative).
+    # Columns 1+ have -inf (no real alternative) and -1 as the invalid
+    # token-id sentinel — guarantees no spurious {0: -inf} downstream.
     for i, tok in enumerate([100, 101, 102], start=1):
         assert lp.logprob_token_ids[i, 0] == tok
         assert lp.logprobs[i, 0] == 0.0
         assert np.all(np.isneginf(lp.logprobs[i, 1:]))
+        assert np.all(lp.logprob_token_ids[i, 1:] == -1)
