@@ -66,6 +66,21 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+def _request_opts_into_jump_decoding(request: Request) -> bool:
+    """Per-request opt-in gate for jump-forward decoding.
+
+    Server-side StructuredOutputsConfig.enable_jump_decoding is the
+    capability gate; this returns True only when the request explicitly
+    asked for FF via SamplingParams.structured_outputs.enable_jump_decoding.
+    Default (None / False) means no FF tokens for the request — safe
+    behavior during a gradual rollout.
+    """
+    sp = request.sampling_params
+    if sp is None or sp.structured_outputs is None:
+        return False
+    return bool(sp.structured_outputs.enable_jump_decoding)
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -1419,6 +1434,7 @@ class Scheduler(SchedulerInterface):
                 and new_token_ids
                 and not stopped
                 and self.structured_output_manager.should_advance(request)
+                and _request_opts_into_jump_decoding(request)
             ):
                 struct_output_request = request.structured_output_request
                 assert struct_output_request is not None

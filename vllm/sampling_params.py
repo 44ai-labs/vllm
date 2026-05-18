@@ -50,6 +50,11 @@ class StructuredOutputsParams:
     disable_additional_properties: bool = False
     whitespace_pattern: str | None = None
     structural_tag: str | None = None
+    enable_jump_decoding: bool | None = None
+    """Per-request opt-in for jump-forward decoding. Requires the server
+    to also enable it via StructuredOutputsConfig.enable_jump_decoding.
+    None/False = no FF tokens for this request; True = use FF when the
+    grammar forces deterministic tokens."""
 
     _backend: str | None = field(default=None, init=False)
     """CAUTION: Should only be set by Processor._validate_structured_output"""

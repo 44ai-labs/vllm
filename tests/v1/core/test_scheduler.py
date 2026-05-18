@@ -4301,12 +4301,18 @@ def test_eagle3_mm_encoder_cache_with_shift():
 # ---------------------------------------------------------------------------
 
 
-def _setup_jump_forward_request(scheduler, request):
-    """Put a request into RUNNING state with prefill done."""
+def _setup_jump_forward_request(scheduler, request, opt_in: bool = True):
+    """Put a request into RUNNING state with prefill done.
+
+    By default opts the request into jump decoding by setting
+    ``sampling_params.structured_outputs.enable_jump_decoding = True``.
+    Set opt_in=False to exercise the per-request opt-out path.
+    """
     request.num_computed_tokens = request.num_tokens
     request.status = RequestStatus.RUNNING
     scheduler.requests[request.request_id] = request
     scheduler.running.append(request)
+    request.sampling_params.structured_outputs = Mock(enable_jump_decoding=opt_in)
 
 
 def _make_mock_grammar(ff_tokens: list[int]):
@@ -4522,3 +4528,33 @@ def test_jump_forward_tokens_logprobs():
         assert lp.logprobs[i, 0] == 0.0
         assert np.all(np.isneginf(lp.logprobs[i, 1:]))
         assert np.all(lp.logprob_token_ids[i, 1:] == -1)
+
+
+def test_jump_forward_skipped_when_request_opts_out():
+    """Server enables JD but request does not opt in — no FF tokens."""
+    scheduler = create_scheduler(enable_jump_decoding=True)
+    scheduler.structured_output_manager.should_advance = Mock(return_value=True)
+
+    requests = create_requests(num_requests=1, max_tokens=20)
+    req = requests[0]
+    _setup_jump_forward_request(scheduler, req, opt_in=False)
+
+    grammar = _make_mock_grammar([100, 101, 102])
+    req.structured_output_request = _make_structured_output_request(grammar)
+
+    scheduler_output = _empty_scheduler_output(req.request_id)
+    model_output = ModelRunnerOutput(
+        req_ids=[req.request_id],
+        req_id_to_index={req.request_id: 0},
+        sampled_token_ids=[[7]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    scheduler.update_from_output(scheduler_output, model_output)
+
+    # Only the sampled token; the grammar's ff_tokens were not consumed.
+    assert list(req.output_token_ids) == [7]
+    assert req.request_id not in scheduler.pending_ff_tokens
+    grammar.advance_ff_tokens.assert_not_called()
