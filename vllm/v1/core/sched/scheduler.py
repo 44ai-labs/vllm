@@ -1440,9 +1440,18 @@ class Scheduler(SchedulerInterface):
                 assert struct_output_request is not None
                 assert struct_output_request.grammar is not None
                 if not struct_output_request.grammar.is_terminated():
+                    jd_start = time.perf_counter()
                     ff_tokens = struct_output_request.grammar.advance_ff_tokens()
+                    jd_elapsed = time.perf_counter() - jd_start
 
                     if ff_tokens:
+                        logger.info(
+                            "[JUMP-FWD] advance_ff_tokens for %s took %.4fs, "
+                            "returned %d tokens",
+                            req_id,
+                            jd_elapsed,
+                            len(ff_tokens),
+                        )
                         # Append ff_tokens one by one, checking stop
                         # conditions after each token (matching the
                         # behavior in _update_request_with_output).
