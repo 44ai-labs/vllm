@@ -81,6 +81,22 @@ def _request_opts_into_jump_decoding(request: Request) -> bool:
     return bool(sp.structured_outputs.enable_jump_decoding)
 
 
+def _request_opts_into_spec_decode(request: Request) -> bool:
+    """Per-request opt-in gate for speculative decoding.
+
+    Server-side SpeculativeConfig is the capability gate; this returns
+    True only when the request explicitly asked for spec drafts via
+    SamplingParams.enable_speculative_decoding. Default (None / False)
+    means proposer-produced drafts are discarded for this request,
+    matching no-spec behavior. JD and spec are mutually exclusive at the
+    request level.
+    """
+    sp = request.sampling_params
+    if sp is None:
+        return False
+    return bool(sp.enable_speculative_decoding)
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -1728,6 +1744,12 @@ class Scheduler(SchedulerInterface):
 
             if request.is_prefill_chunk:
                 # Ignore draft tokens for prefill chunks.
+                if request.spec_token_ids:
+                    request.spec_token_ids = []
+                continue
+
+            if not _request_opts_into_spec_decode(request):
+                # Per-request opt-out: drop proposer-produced drafts.
                 if request.spec_token_ids:
                     request.spec_token_ids = []
                 continue

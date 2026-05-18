@@ -4530,6 +4530,44 @@ def test_jump_forward_tokens_logprobs():
         assert np.all(lp.logprob_token_ids[i, 1:] == -1)
 
 
+def test_spec_drafts_dropped_when_request_opts_out():
+    """Proposer-produced drafts are discarded for requests that did not
+    opt into speculative decoding."""
+    scheduler = create_scheduler()
+    requests = create_requests(num_requests=1, max_tokens=20)
+    req = requests[0]
+    req.num_computed_tokens = req.num_tokens
+    req.status = RequestStatus.RUNNING
+    scheduler.requests[req.request_id] = req
+    scheduler.running.append(req)
+    # No opt-in (default None).
+    req.sampling_params.enable_speculative_decoding = None
+
+    scheduler.update_draft_token_ids(
+        DraftTokenIds(req_ids=[req.request_id], draft_token_ids=[[100, 101]])
+    )
+
+    assert req.spec_token_ids == []
+
+
+def test_spec_drafts_kept_when_request_opts_in():
+    """Drafts are stored on the request when it explicitly opts in."""
+    scheduler = create_scheduler()
+    requests = create_requests(num_requests=1, max_tokens=20)
+    req = requests[0]
+    req.num_computed_tokens = req.num_tokens
+    req.status = RequestStatus.RUNNING
+    scheduler.requests[req.request_id] = req
+    scheduler.running.append(req)
+    req.sampling_params.enable_speculative_decoding = True
+
+    scheduler.update_draft_token_ids(
+        DraftTokenIds(req_ids=[req.request_id], draft_token_ids=[[100, 101]])
+    )
+
+    assert req.spec_token_ids == [100, 101]
+
+
 def test_jump_forward_skipped_when_request_opts_out():
     """Server enables JD but request does not opt in — no FF tokens."""
     scheduler = create_scheduler(enable_jump_decoding=True)
