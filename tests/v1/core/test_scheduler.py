@@ -4396,6 +4396,10 @@ def test_jump_forward_tokens_stop_eos():
     assert list(req.output_token_ids) == [7, 100, EOS_TOKEN_ID]
     assert req.status == RequestStatus.FINISHED_STOPPED
     assert scheduler.pending_ff_tokens[req.request_id] == [100, EOS_TOKEN_ID]
+    # Stop cleanup must run for FF-triggered stops: request is gone from
+    # the running queue and finished_req_ids tracks it.
+    assert req not in scheduler.running
+    assert req.request_id in scheduler.finished_req_ids
 
 
 def test_jump_forward_tokens_stop_max_tokens():
@@ -4426,6 +4430,8 @@ def test_jump_forward_tokens_stop_max_tokens():
 
     assert list(req.output_token_ids) == [7, 100, 101]
     assert req.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert req not in scheduler.running
+    assert req.request_id in scheduler.finished_req_ids
 
 
 def test_jump_forward_tokens_retain_unscheduled():

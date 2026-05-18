@@ -1367,6 +1367,7 @@ class Scheduler(SchedulerInterface):
             new_token_ids = generated_token_ids
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             kv_transfer_params = None
+            finish_reason = None
             status_before_stop = request.status
 
             # Check for stop and update request status.
@@ -1403,19 +1404,6 @@ class Scheduler(SchedulerInterface):
                 and req_id in model_runner_output.routed_experts_dict
             ):
                 routed_experts = model_runner_output.routed_experts_dict[req_id]
-            finish_reason = None
-            if stopped:
-                # Capture finish_reason BEFORE _handle_stopped_request, which may
-                # reset the status to WAITING for streaming requests that continue.
-                finish_reason = request.get_finished_reason()
-                finished = self._handle_stopped_request(request)
-                if finished:
-                    kv_transfer_params = self._free_request(request)
-
-                if status_before_stop == RequestStatus.RUNNING:
-                    stopped_running_reqs.add(request)
-                else:
-                    stopped_preempted_reqs.add(request)
 
             # Extract sample logprobs if needed.
             if (
@@ -1483,6 +1471,23 @@ class Scheduler(SchedulerInterface):
                                 ),
                                 None,
                             )
+
+            # Handle stop after FF so requests stopped by grammar-forced
+            # tokens (EOS/max_tokens hit inside the FF loop) go through the
+            # same cleanup as model-sampled stops.
+            if stopped:
+                # Capture finish_reason BEFORE _handle_stopped_request, which
+                # may reset the status to WAITING for streaming requests that
+                # continue.
+                finish_reason = request.get_finished_reason()
+                finished = self._handle_stopped_request(request)
+                if finished:
+                    kv_transfer_params = self._free_request(request)
+
+                if status_before_stop == RequestStatus.RUNNING:
+                    stopped_running_reqs.add(request)
+                else:
+                    stopped_preempted_reqs.add(request)
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
