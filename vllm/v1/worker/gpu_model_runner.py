@@ -1392,7 +1392,15 @@ class GPUModelRunner(
             if ff_tokens:
                 start_idx = self.input_batch.num_tokens_no_spec[req_index]
                 end_idx = start_idx + len(ff_tokens)
+                assert end_idx <= self.max_model_len, (
+                    f"Jump-forward tokens exceed max_model_len "
+                    f"({end_idx} > {self.max_model_len}) for request {req_id}."
+                )
                 self.input_batch.token_ids_cpu[req_index, start_idx:end_idx] = ff_tokens
+                # Mark as token IDs (not embeddings) so prompt_embeds-enabled
+                # runs preprocess these positions as token IDs, matching the
+                # sampled-token path above.
+                self.input_batch.is_token_ids[req_index, start_idx:end_idx] = True
                 self.input_batch.num_tokens_no_spec[req_index] = end_idx
                 req_state.output_token_ids.extend(ff_tokens)
 
