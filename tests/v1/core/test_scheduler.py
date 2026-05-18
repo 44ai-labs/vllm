@@ -4568,6 +4568,21 @@ def test_spec_drafts_kept_when_request_opts_in():
     assert req.spec_token_ids == [100, 101]
 
 
+def test_jd_and_spec_mutex_per_request():
+    """A single request cannot enable both jump decoding and speculative
+    decoding — _validate_spec_decode rejects it."""
+    from vllm.sampling_params import StructuredOutputsParams
+
+    sp = SamplingParams(
+        enable_speculative_decoding=True,
+        structured_outputs=StructuredOutputsParams(
+            json="{}", enable_jump_decoding=True
+        ),
+    )
+    with pytest.raises(ValueError, match="cannot both be"):
+        sp._validate_spec_decode(speculative_config=None)
+
+
 def test_jump_forward_skipped_when_request_opts_out():
     """Server enables JD but request does not opt in — no FF tokens."""
     scheduler = create_scheduler(enable_jump_decoding=True)

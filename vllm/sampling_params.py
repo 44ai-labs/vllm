@@ -780,6 +780,21 @@ class SamplingParams(
         self,
         speculative_config: SpeculativeConfig | None,
     ) -> None:
+        # Jump-forward decoding and speculative decoding can both be
+        # capabilities of the server, but a single request can't use both
+        # — they write to overlapping positions in the input buffer and
+        # have incompatible verification semantics.
+        if (
+            self.enable_speculative_decoding
+            and self.structured_outputs is not None
+            and self.structured_outputs.enable_jump_decoding
+        ):
+            raise ValueError(
+                "enable_speculative_decoding and "
+                "structured_outputs.enable_jump_decoding cannot both be "
+                "true on the same request — choose one."
+            )
+
         if speculative_config is None:
             return
 
