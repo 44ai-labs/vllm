@@ -1780,6 +1780,21 @@ class Scheduler(SchedulerInterface):
                 continue
 
             orig_num_spec_tokens = len(placeholder_spec_tokens)
+
+            # Per-request opt-out for speculative decoding. The async
+            # scheduling path routes drafts through this function instead
+            # of update_draft_token_ids, so the gate has to be mirrored
+            # here. Invalidate the scheduled drafts in scheduler_output
+            # directly (the local draft_token_ids list is not read
+            # downstream) by writing -1 sentinels into sched_spec_tokens
+            # and recording them as invalid. The verifier rejects -1 slots
+            # and the request falls back to single-token decode for this
+            # step.
+            if not _request_opts_into_spec_decode(request):
+                sched_spec_tokens[req_id] = [-1] * orig_num_spec_tokens
+                num_invalid_spec_tokens[req_id] = orig_num_spec_tokens
+                continue
+
             # Trim drafts to scheduled number of spec tokens
             # (needed for chunked prefill case for example).
             del spec_token_ids[orig_num_spec_tokens:]
