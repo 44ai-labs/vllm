@@ -283,8 +283,18 @@ class StructuredOutputManager:
                         apply_bitmask = False
                     if apply_bitmask and not grammar.is_terminated():
                         accepted = grammar.accept_tokens(req_id, [token])
-                        assert accepted, (token, req_id, scheduled_spec_decode_tokens)
-                        state_advancements += 1
+                        if not accepted:
+                            # The drafter (proposer) is not grammar-constrained,
+                            # so it can propose a token the grammar forbids. The
+                            # bitmask filled for THIS position above already
+                            # excludes it, so verification will reject this draft
+                            # and (by speculative-decoding semantics) every draft
+                            # after it. Stop advancing the grammar; the remaining
+                            # positions get a full mask and are discarded after
+                            # the rejection.
+                            apply_bitmask = False
+                        else:
+                            state_advancements += 1
                     cumulative_index += 1
                 if state_advancements > 0:
                     grammar.rollback(state_advancements)
