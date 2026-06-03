@@ -1399,13 +1399,30 @@ class Scheduler(SchedulerInterface):
                 struct_output_request = request.structured_output_request
                 assert struct_output_request is not None
                 assert struct_output_request.grammar is not None
-                if not struct_output_request.grammar.accept_tokens(  # type: ignore[union-attr]
-                    req_id, new_token_ids
+                # Generation-control tokens (EOS / stop_token_ids) are not part
+                # of the constrained language; never advance the grammar over
+                # them. Under spec decode a verified turn-end token (e.g. Gemma
+                # <end_of_turn>=106, which is NOT the matcher's eos) would
+                # otherwise be parsed as content and falsely terminate the
+                # request. A stop token only appears here when the request is
+                # already stopping (check_stop trimmed everything after it), so
+                # dropping it before the advance loses no real grammar state.
+                _stop_ids = (
+                    request.sampling_params.all_stop_token_ids
+                    if request.sampling_params is not None
+                    else frozenset()
+                )
+                grammar_token_ids = [t for t in new_token_ids if t not in _stop_ids]
+                if (
+                    grammar_token_ids
+                    and not struct_output_request.grammar.accept_tokens(  # type: ignore[union-attr]
+                        req_id, grammar_token_ids
+                    )
                 ):
                     logger.error(
                         "Unexpected: grammar rejected tokens %s for request %s. "
                         "Terminating request.",
-                        new_token_ids,
+                        grammar_token_ids,
                         req_id,
                     )
                     request.status = RequestStatus.FINISHED_ERROR
