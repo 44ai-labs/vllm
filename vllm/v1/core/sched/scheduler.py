@@ -81,6 +81,22 @@ def _request_opts_into_jump_decoding(request: Request) -> bool:
     return bool(sp.structured_outputs.enable_jump_decoding)
 
 
+def _request_opts_into_spec_decode(request: Request) -> bool:
+    """Per-request opt-in gate for speculative decoding.
+
+    Server-side SpeculativeConfig is the capability gate; this returns
+    True only when the request explicitly asked for spec drafts via
+    SamplingParams.enable_speculative_decoding. Default (None / False)
+    means proposer-produced drafts are discarded for this request,
+    matching no-spec behavior. JD and spec are mutually exclusive at the
+    request level.
+    """
+    sp = request.sampling_params
+    if sp is None:
+        return False
+    return bool(sp.enable_speculative_decoding)
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -1749,6 +1765,12 @@ class Scheduler(SchedulerInterface):
                     request.spec_token_ids = []
                 continue
 
+            if not _request_opts_into_spec_decode(request):
+                # Per-request opt-out: drop proposer-produced drafts.
+                if request.spec_token_ids:
+                    request.spec_token_ids = []
+                continue
+
             # Add newly generated spec token ids to the request.
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
@@ -1775,6 +1797,21 @@ class Scheduler(SchedulerInterface):
                 continue
 
             orig_num_spec_tokens = len(placeholder_spec_tokens)
+
+            # Per-request opt-out for speculative decoding. The async
+            # scheduling path routes drafts through this function instead
+            # of update_draft_token_ids, so the gate has to be mirrored
+            # here. Invalidate the scheduled drafts in scheduler_output
+            # directly (the local draft_token_ids list is not read
+            # downstream) by writing -1 sentinels into sched_spec_tokens
+            # and recording them as invalid. The verifier rejects -1 slots
+            # and the request falls back to single-token decode for this
+            # step.
+            if not _request_opts_into_spec_decode(request):
+                sched_spec_tokens[req_id] = [-1] * orig_num_spec_tokens
+                num_invalid_spec_tokens[req_id] = orig_num_spec_tokens
+                continue
+
             # Trim drafts to scheduled number of spec tokens
             # (needed for chunked prefill case for example).
             del spec_token_ids[orig_num_spec_tokens:]
@@ -1818,6 +1855,22 @@ class Scheduler(SchedulerInterface):
             self.requests[request.request_id] = request
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+            # [REQ-FLAGS] one line per request: raw per-request JD / MTP flags
+            # and the resolved opt-in decision the scheduler will act on, so a
+            # request that silently ran with (or without) MTP/JD is visible.
+            _sp = request.sampling_params
+            _mtp_raw = None if _sp is None else _sp.enable_speculative_decoding
+            _so = None if _sp is None else _sp.structured_outputs
+            _jd_raw = None if _so is None else _so.enable_jump_decoding
+            logger.info(
+                "[REQ-FLAGS] req=%s mtp=%s(opt_in=%s) jd=%s(opt_in=%s) structured=%s",
+                request.request_id,
+                _mtp_raw,
+                _request_opts_into_spec_decode(request),
+                _jd_raw,
+                _request_opts_into_jump_decoding(request),
+                request.use_structured_output,
+            )
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus

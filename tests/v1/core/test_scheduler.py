@@ -4530,6 +4530,110 @@ def test_jump_forward_tokens_logprobs():
         assert np.all(lp.logprob_token_ids[i, 1:] == -1)
 
 
+def test_spec_drafts_dropped_when_request_opts_out():
+    """Proposer-produced drafts are discarded for requests that did not
+    opt into speculative decoding."""
+    scheduler = create_scheduler()
+    requests = create_requests(num_requests=1, max_tokens=20)
+    req = requests[0]
+    req.num_computed_tokens = req.num_tokens
+    req.status = RequestStatus.RUNNING
+    scheduler.requests[req.request_id] = req
+    scheduler.running.append(req)
+    # No opt-in (default None).
+    req.sampling_params.enable_speculative_decoding = None
+
+    scheduler.update_draft_token_ids(
+        DraftTokenIds(req_ids=[req.request_id], draft_token_ids=[[100, 101]])
+    )
+
+    assert req.spec_token_ids == []
+
+
+def test_spec_drafts_dropped_when_request_opts_out_async_path():
+    """Async-scheduling counterpart: drafts in
+    scheduler_output.scheduled_spec_decode_tokens are overwritten with -1
+    sentinels (and counted as invalid) when the request did not opt into
+    speculative decoding. This exercises update_draft_token_ids_in_output,
+    the entry point used by step_with_batch_queue."""
+    scheduler = create_scheduler()
+    requests = create_requests(num_requests=1, max_tokens=20)
+    req = requests[0]
+    req.num_computed_tokens = req.num_tokens
+    req.status = RequestStatus.RUNNING
+    scheduler.requests[req.request_id] = req
+    scheduler.running.append(req)
+    # No opt-in (default None).
+    req.sampling_params.enable_speculative_decoding = None
+
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={req.request_id: 1},
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={req.request_id: [100, 101, 102]},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+
+    scheduler.update_draft_token_ids_in_output(
+        DraftTokenIds(req_ids=[req.request_id], draft_token_ids=[[100, 101, 102]]),
+        scheduler_output,
+    )
+
+    assert scheduler_output.scheduled_spec_decode_tokens[req.request_id] == [
+        -1,
+        -1,
+        -1,
+    ]
+    assert scheduler_output.num_invalid_spec_tokens is not None
+    assert scheduler_output.num_invalid_spec_tokens[req.request_id] == 3
+
+
+def test_spec_drafts_kept_when_request_opts_in():
+    """Drafts are stored on the request when it explicitly opts in."""
+    scheduler = create_scheduler()
+    requests = create_requests(num_requests=1, max_tokens=20)
+    req = requests[0]
+    req.num_computed_tokens = req.num_tokens
+    req.status = RequestStatus.RUNNING
+    scheduler.requests[req.request_id] = req
+    scheduler.running.append(req)
+    req.sampling_params.enable_speculative_decoding = True
+
+    scheduler.update_draft_token_ids(
+        DraftTokenIds(req_ids=[req.request_id], draft_token_ids=[[100, 101]])
+    )
+
+    assert req.spec_token_ids == [100, 101]
+
+
+def test_jd_and_spec_mutex_per_request():
+    """A single request cannot enable both jump decoding and speculative
+    decoding — _validate_spec_decode rejects it."""
+    from vllm.sampling_params import StructuredOutputsParams
+
+    sp = SamplingParams(
+        enable_speculative_decoding=True,
+        structured_outputs=StructuredOutputsParams(
+            json="{}", enable_jump_decoding=True
+        ),
+    )
+    with pytest.raises(ValueError, match="cannot both be"):
+        sp._validate_spec_decode(speculative_config=None)
+
+
+def test_spec_decoding_rejected_when_server_has_no_spec_config():
+    """Per-request enable_speculative_decoding=True against a server that
+    was not started with --speculative-config must raise — silently
+    accepting and ignoring it masks deployment-config errors."""
+    sp = SamplingParams(enable_speculative_decoding=True)
+    with pytest.raises(ValueError, match="no SpeculativeConfig"):
+        sp._validate_spec_decode(speculative_config=None)
+
+
 def test_jump_decoding_rejected_when_server_jd_disabled():
     """Per-request enable_jump_decoding=True against a server that does NOT
     have enable_jump_decoding in its --structured-outputs-config must raise.
@@ -4553,9 +4657,7 @@ def test_jump_decoding_rejected_when_server_jd_disabled():
         )
     # Case 2: server has no structured_outputs config at all.
     with pytest.raises(ValueError, match="enable_jump_decoding"):
-        sp._validate_structured_outputs(
-            structured_outputs_config=None, tokenizer=None
-        )
+        sp._validate_structured_outputs(structured_outputs_config=None, tokenizer=None)
 
 
 def test_jump_forward_skipped_when_request_opts_out():
