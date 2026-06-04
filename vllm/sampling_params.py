@@ -277,6 +277,13 @@ class SamplingParams(
     """Whether to return per-token detokenized strings alongside generated
     text.  When True the detokenizer accumulates the individual
     ``decode_next()`` results so they can be surfaced in the response."""
+    enable_speculative_decoding: bool | None = None
+    """Per-request opt-in for speculative decoding. Requires the server
+    to also have a SpeculativeConfig (e.g. ``--speculative-config '{...}'``).
+    None/False = drafts produced by the proposer are discarded for this
+    request (it runs as if speculative decoding were off); True = drafts
+    are used. Mutually exclusive with
+    ``structured_outputs.enable_jump_decoding`` on the same request."""
     skip_clone: bool = False
     """Internal flag indicating that this SamplingParams instance is safe to
     reuse without cloning. When True, clone() will return self without
@@ -349,6 +356,7 @@ class SamplingParams(
         spaces_between_special_tokens: bool = True,
         output_kind: RequestOutputKind = RequestOutputKind.CUMULATIVE,
         return_token_texts: bool = False,
+        enable_speculative_decoding: bool | None = None,
         structured_outputs: StructuredOutputsParams | None = None,
         logit_bias: dict[int, float] | dict[str, float] | None = None,
         allowed_token_ids: list[int] | None = None,
@@ -391,6 +399,7 @@ class SamplingParams(
             spaces_between_special_tokens=spaces_between_special_tokens,
             output_kind=output_kind,
             return_token_texts=return_token_texts,
+            enable_speculative_decoding=enable_speculative_decoding,
             structured_outputs=structured_outputs,
             logit_bias=logit_bias,
             allowed_token_ids=allowed_token_ids,
@@ -771,6 +780,33 @@ class SamplingParams(
         self,
         speculative_config: SpeculativeConfig | None,
     ) -> None:
+        # Jump-forward decoding and speculative decoding can both be
+        # capabilities of the server, but a single request can't use both
+        # — they write to overlapping positions in the input buffer and
+        # have incompatible verification semantics.
+        if (
+            self.enable_speculative_decoding
+            and self.structured_outputs is not None
+            and self.structured_outputs.enable_jump_decoding
+        ):
+            raise ValueError(
+                "enable_speculative_decoding and "
+                "structured_outputs.enable_jump_decoding cannot both be "
+                "true on the same request — choose one."
+            )
+
+        # Reject per-request MTP opt-in against a server that has no
+        # SpeculativeConfig (no --speculative-config flag). Without it the
+        # proposer model is not loaded and the per-request flag would be a
+        # silent no-op, masking deployment-config bugs as performance issues.
+        if self.enable_speculative_decoding and speculative_config is None:
+            raise ValueError(
+                "enable_speculative_decoding=True was set on this request, "
+                "but the server has no SpeculativeConfig (start with "
+                '--speculative-config \'{"method":"...",...}\'). The flag '
+                "would otherwise be silently ignored."
+            )
+
         if speculative_config is None:
             return
 

@@ -888,14 +888,10 @@ class VllmConfig:
             "enabled" if self.scheduler_config.async_scheduling else "disabled",
         )
 
-        if (
-            self.speculative_config is not None
-            and self.structured_outputs_config.enable_jump_decoding
-        ):
-            raise ValueError(
-                "Jump-forward decoding cannot be used together with "
-                "speculative decoding."
-            )
+        # Jump decoding and speculative decoding are now per-request opt-in
+        # (SamplingParams.structured_outputs.enable_jump_decoding and
+        # SamplingParams.enable_speculative_decoding). Mutual exclusion is
+        # enforced at the request level — see SamplingParams validation.
 
         if self.parallel_config.disable_nccl_for_dp_synchronization is None:
             if self.scheduler_config.async_scheduling:

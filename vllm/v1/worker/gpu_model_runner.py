@@ -4302,7 +4302,18 @@ class GPUModelRunner(
 
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
-        if spec_config is not None:
+        # Per-request MTP opt-out (async-safe): if no scheduled request opted into
+        # speculative decoding, skip the drafter entirely so the no-spec path keeps
+        # baseline latency. The scheduler-side gate stops these drafts from being
+        # *scheduled*, but under async scheduling it cannot stop the worker from
+        # *computing* them; this closes that gap. Reuses the "input doesn't fit"
+        # zero-out below so no stale drafts are scheduled next step.
+        if spec_config is not None and not self._any_request_opts_into_spec():
+            self._draft_token_ids = torch.zeros(
+                1, device=self.device, dtype=torch.int32
+            ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
+            self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
+        elif spec_config is not None:
             # Decide whether to run the drafter or zero out draft tokens.
             input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
                 spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
@@ -4598,6 +4609,28 @@ class GPUModelRunner(
         assert counts_cpu is not None
         sampled_count_event.synchronize()
         return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
+
+    def _any_request_opts_into_spec(self) -> bool:
+        """Whether any request in the current batch opted into speculative decoding.
+
+        Per-request opt-in lives in ``SamplingParams.enable_speculative_decoding``
+        and mirrors the scheduler-side ``_request_opts_into_spec_decode`` gate. Under
+        async scheduling the scheduler cannot stop the worker from drafting, so
+        ``execute_model`` uses this to skip the drafter when no request wants it,
+        keeping the no-spec path at baseline latency. Short-circuits on the first
+        opted-in request.
+        """
+        for req_id in self.input_batch.req_ids:
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            sampling_params = req_state.sampling_params
+            if (
+                sampling_params is not None
+                and sampling_params.enable_speculative_decoding
+            ):
+                return True
+        return False
 
     def propose_draft_token_ids(
         self,
