@@ -220,6 +220,24 @@ class GuidanceGrammar(StructuredOutputGrammar):
     def is_terminated(self) -> bool:
         return self.terminated
 
+    def clone_for_speculation(self) -> "GuidanceGrammar":
+        """Deep-copy the matcher (and its Python-side flags) so the copy can
+        be advanced through speculative draft tokens and then discarded
+        without ever mutating the committed matcher.
+
+        ``LLMatcher.deep_copy`` is an isolating clone (~1us), which makes the
+        speculative snapshot/restore trivially correct: there is nothing to
+        roll back because the original is never touched.
+        """
+        return GuidanceGrammar(
+            ll_matcher=self.ll_matcher.deep_copy(),
+            ll_tokenizer=self.ll_tokenizer,
+            vocab_size=self.vocab_size,
+            printed_error=self.printed_error,
+            terminated=self.terminated,
+            rollback_lag=self.rollback_lag,
+        )
+
     def reset(self):
         # This method may be not needed anymore? TODO
         self.ll_matcher.reset()

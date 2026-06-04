@@ -96,6 +96,18 @@ class StructuredOutputGrammar(ABC):
         """
         return []
 
+    def clone_for_speculation(self) -> "StructuredOutputGrammar | None":
+        """Return an independent copy of this grammar for speculative
+        advancement, or None if the backend cannot cheaply clone.
+
+        The copy is meant to be advanced through tentative
+        (speculative-decode draft) tokens and then discarded, so that the
+        committed grammar state is never mutated and no (potentially
+        non-inverting) rollback is required. Backends that return None
+        fall back to the legacy accept-then-rollback walk.
+        """
+        return None
+
     @abstractmethod
     def reset(self):
         """
