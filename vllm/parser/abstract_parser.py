@@ -644,8 +644,28 @@ class DelegatingParser(Parser):
             return False
         return not state.reasoning_ended
 
-    def _in_tool_call_phase(self, state: StreamState) -> bool:
+    def _request_uses_tools(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> bool:
+        """Whether this request opted into tool calls.
+
+        When it did not, the tool parser must not run on the model's content.
+        The (gemma-style) tool parser buffers leading text that could begin a
+        tool-call marker (e.g. a lone '<'), which silently holds/drops plain
+        content for tool-less requests. This mirrors the pre-unified-parser
+        chat-streaming gate, where auto tool streaming required request.tools.
+        """
+        tools = getattr(request, "tools", None)
+        if not tools:
+            return False
+        return getattr(request, "tool_choice", None) != "none"
+
+    def _in_tool_call_phase(
+        self, state: StreamState, request: ChatCompletionRequest | ResponsesRequest
+    ) -> bool:
         if self._tool_parser is None:
+            return False
+        if not self._request_uses_tools(request):
             return False
         return state.reasoning_ended
 
@@ -679,18 +699,22 @@ class DelegatingParser(Parser):
                 current_token_ids=current_token_ids,
                 delta_token_ids=delta_token_ids,
             )
-            # Hand off remaining content to tool parser
+            # Reasoning ended in this delta: mark it. Only hand the remaining
+            # content to the tool parser when this request actually uses tools;
+            # otherwise leave it on delta_message.content so it is emitted as
+            # content instead of being buffered through the tool parser.
             if self._tool_parser and self.is_reasoning_end(delta_token_ids):
                 state.reasoning_ended = True
-                current_token_ids = self.extract_content_ids(delta_token_ids)
-                if delta_message and delta_message.content:
-                    current_text = delta_message.content
-                    delta_message.content = None
-                else:
-                    current_text = ""
+                if self._request_uses_tools(request):
+                    current_token_ids = self.extract_content_ids(delta_token_ids)
+                    if delta_message and delta_message.content:
+                        current_text = delta_message.content
+                        delta_message.content = None
+                    else:
+                        current_text = ""
 
         # Tool call extraction
-        if self._in_tool_call_phase(state):
+        if self._in_tool_call_phase(state, request):
             if not state.tool_call_text_started:
                 state.tool_call_text_started = True
                 state.previous_text = ""
@@ -723,7 +747,7 @@ class DelegatingParser(Parser):
         if (
             delta_message is None
             and not self._in_reasoning_phase(state)
-            and not self._in_tool_call_phase(state)
+            and not self._in_tool_call_phase(state, request)
         ):
             delta_message = DeltaMessage(content=delta_text)
 
