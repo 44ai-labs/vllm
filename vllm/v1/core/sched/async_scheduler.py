@@ -51,6 +51,16 @@ class AsyncScheduler(Scheduler):
             request.discard_latest_async_tokens = False
             return [], False
 
+        if request.jd_discard_pending > 0:
+            # Jump-forward tokens were emitted while this step was in
+            # flight: its sample is conditioned on a pre-jump context (the
+            # ff tokens were not part of its forward pass). Drop it; the
+            # position is re-decoded after the ff tokens are processed.
+            # num_output_placeholders was already released at ff-emission
+            # time, so no decrement here.
+            request.jd_discard_pending -= 1
+            return [], False
+
         status_before_update = request.status
         new_token_ids, stopped = super()._update_request_with_output(
             request, new_token_ids

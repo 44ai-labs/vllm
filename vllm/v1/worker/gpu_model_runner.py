@@ -1241,6 +1241,18 @@ class GPUModelRunner(
             num_output_tokens = req_data.num_output_tokens[i]
             req_index = self.input_batch.req_id_to_index.get(req_id)
 
+            if (
+                self.use_async_scheduling
+                and req_state.prev_num_draft_len
+                and req_id in scheduler_output.jump_forward_tokens
+            ):
+                # The previous step for this request was discarded at
+                # ff-emission time (async jump-forward); its draft lanes are
+                # dead. Reset the continuation state so the optimistic async
+                # spec-decode bookkeeping below does not extend the output
+                # mirror or queue corrections for them.
+                req_state.prev_num_draft_len = 0
+
             if req_state.prev_num_draft_len and self.use_async_scheduling:
                 # prev_num_draft_len is used in async scheduling mode with
                 # spec decode. it indicates if need to update num_computed_tokens
@@ -1390,7 +1402,17 @@ class GPUModelRunner(
             # Jump-forward: write grammar-forced tokens to the buffer.
             ff_tokens = scheduler_output.jump_forward_tokens.get(req_id)
             if ff_tokens:
-                start_idx = self.input_batch.num_tokens_no_spec[req_index]
+                # Anchor the ff span to scheduler coordinates: the first ff
+                # token's row is (prompt + scheduler-reported outputs - n_ff).
+                # num_tokens_no_spec can sit one row past that under async
+                # scheduling, where bookkeeping already claimed a row for an
+                # in-flight sample that the scheduler has since discarded at
+                # ff-emission time; appending there would shift the ff span,
+                # leave the stale -1 placeholder embedded in the input, and
+                # drop the last ff token under the sampled-token scatter.
+                start_idx = (
+                    req_state.num_prompt_tokens + num_output_tokens - len(ff_tokens)
+                )
                 end_idx = start_idx + len(ff_tokens)
                 assert end_idx <= self.max_model_len, (
                     f"Jump-forward tokens exceed max_model_len "
@@ -1402,6 +1424,10 @@ class GPUModelRunner(
                 # sampled-token path above.
                 self.input_batch.is_token_ids[req_index, start_idx:end_idx] = True
                 self.input_batch.num_tokens_no_spec[req_index] = end_idx
+                # Align the output mirror with the committed prefix before
+                # appending: drops the optimistic placeholder entry of a
+                # discarded in-flight sample, if any.
+                del req_state.output_token_ids[num_output_tokens - len(ff_tokens) :]
                 req_state.output_token_ids.extend(ff_tokens)
 
         # Add the new or resumed requests to the persistent batch.
@@ -1696,9 +1722,12 @@ class GPUModelRunner(
         for cur_index in range(num_reqs):
             prev_index = prev_positions[cur_index]
             if prev_index < 0:
+                # New request, or a jump-forward request severed from the
+                # previous iteration in _prepare_inputs (its in-flight
+                # sample/drafts were discarded at ff-emission time).
                 continue
-            prev_indices.append(prev_index)
             req_id = self.input_batch.req_ids[cur_index]
+            prev_indices.append(prev_index)
             # We need to compute the flattened input_ids index of the
             # last token in each common request.
             draft_len = len(scheduled_spec_tokens.get(req_id, ()))
@@ -1966,6 +1995,17 @@ class GPUModelRunner(
         # Used for gathering from previous iteration's GPU tensors.
         prev_req_id_to_index = self.input_batch.prev_req_id_to_index
         self._compute_prev_positions(num_reqs)
+
+        # Jump-forward (async scheduling): a request carrying ff tokens this
+        # step had its previous in-flight step discarded at ff-emission time
+        # (its sample and draft lanes are dead). Sever it from the previous
+        # iteration entirely -- no sampled-token scatter, no draft-token
+        # scatter, no optimistic accept-count / num_computed corrections --
+        # by treating it as a new request in the mapping.
+        if scheduler_output.jump_forward_tokens and prev_req_id_to_index:
+            for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                if req_id in scheduler_output.jump_forward_tokens:
+                    self.prev_positions.np[i] = -1
 
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
         num_tokens_np = np.array(num_tokens, dtype=np.int32)

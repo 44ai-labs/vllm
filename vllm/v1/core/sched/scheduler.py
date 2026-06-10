@@ -976,6 +976,9 @@ class Scheduler(SchedulerInterface):
         request.num_computed_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
+        # Preemption drops all in-flight output, so a pending jump-forward
+        # discard must not survive and eat the first post-resume token.
+        request.jd_discard_pending = 0
         request.num_preemptions += 1
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
@@ -1366,7 +1369,14 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
-            if scheduled_spec_token_ids and generated_token_ids:
+            if (
+                scheduled_spec_token_ids
+                and generated_token_ids
+                # Skip for a step discarded at jump-forward emission: its
+                # accounting (placeholders, num_computed over the dead
+                # draft positions) was already settled there.
+                and request.jd_discard_pending == 0
+            ):
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
                 num_rejected = num_draft_tokens - num_accepted
@@ -1496,6 +1506,39 @@ class Scheduler(SchedulerInterface):
                                 ff_tokens = ff_tokens[: i + 1]
                                 break
                         self.pending_ff_tokens[req_id] = ff_tokens
+
+                        # Async scheduling: a step already in flight was
+                        # forwarded BEFORE these ff tokens existed, so its
+                        # sample is conditioned on a pre-jump context while
+                        # the (deferred) mask and the committed ordering are
+                        # post-jump. Discard that step's sample and re-decode
+                        # the position after the ff tokens are processed —
+                        # one extra forward per jump, mirroring the ff
+                        # mini-prefill step the sync path pays anyway.
+                        # Releasing the placeholders here (instead of in
+                        # _update_request_with_output) lets the next
+                        # schedule() lay out positions without the dead
+                        # slots; the async scheduler drops the sample values
+                        # when they arrive, without re-decrementing.
+                        if not stopped and request.num_output_placeholders > 0:
+                            # Batch-queue depth 2: at most one step in
+                            # flight; its output arrives in one update.
+                            request.jd_discard_pending += 1
+                            request.num_output_placeholders = 0
+                            # With spec decode, the in-flight step's chunk
+                            # also covered K draft positions -- exactly
+                            # where the ff tokens now belong -- and
+                            # schedule() already counted them as computed.
+                            # Those lanes are dead: mark the positions
+                            # uncomputed so the next schedule() re-runs the
+                            # full ff span through the target (mirrors the
+                            # spec-rejection rollback above), and drop the
+                            # dead spec placeholders.
+                            request.num_computed_tokens = min(
+                                request.num_computed_tokens,
+                                request.num_tokens - len(ff_tokens),
+                            )
+                            request.spec_token_ids = []
 
                         # Extend logprobs for ff_tokens: each is
                         # deterministic (logprob=0, all others=-inf),
