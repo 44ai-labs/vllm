@@ -1483,18 +1483,9 @@ class Scheduler(SchedulerInterface):
                 assert struct_output_request is not None
                 assert struct_output_request.grammar is not None
                 if not struct_output_request.grammar.is_terminated():
-                    jd_start = time.perf_counter()
                     ff_tokens = struct_output_request.grammar.advance_ff_tokens()
-                    jd_elapsed = time.perf_counter() - jd_start
 
                     if ff_tokens:
-                        logger.info(
-                            "[JUMP-FWD] advance_ff_tokens for %s took %.4fs, "
-                            "returned %d tokens",
-                            req_id,
-                            jd_elapsed,
-                            len(ff_tokens),
-                        )
                         # Append ff_tokens one by one, checking stop
                         # conditions after each token (matching the
                         # behavior in _update_request_with_output).
@@ -1898,22 +1889,6 @@ class Scheduler(SchedulerInterface):
             self.requests[request.request_id] = request
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
-            # [REQ-FLAGS] one line per request: raw per-request JD / MTP flags
-            # and the resolved opt-in decision the scheduler will act on, so a
-            # request that silently ran with (or without) MTP/JD is visible.
-            _sp = request.sampling_params
-            _mtp_raw = None if _sp is None else _sp.enable_speculative_decoding
-            _so = None if _sp is None else _sp.structured_outputs
-            _jd_raw = None if _so is None else _so.enable_jump_decoding
-            logger.info(
-                "[REQ-FLAGS] req=%s mtp=%s(opt_in=%s) jd=%s(opt_in=%s) structured=%s",
-                request.request_id,
-                _mtp_raw,
-                _request_opts_into_spec_decode(request),
-                _jd_raw,
-                _request_opts_into_jump_decoding(request),
-                request.use_structured_output,
-            )
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
