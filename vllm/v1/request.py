@@ -141,6 +141,13 @@ class Request:
         self.num_output_placeholders = 0
         # Used in forced preemption (reset_prefix_cache) with async scheduling.
         self.discard_latest_async_tokens = False
+        # Async scheduling + jump-forward decoding: number of in-flight steps
+        # whose sample must be discarded. Set when ff tokens are emitted while
+        # a step is in flight — that step's forward predates the jump, so its
+        # sample is conditioned on a pre-jump context while being masked (and
+        # ordered) post-jump. The async scheduler drops the step's output and
+        # the position is re-decoded after the ff tokens are processed.
+        self.jd_discard_pending = 0
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0

@@ -50,6 +50,11 @@ class StructuredOutputsParams:
     disable_additional_properties: bool = False
     whitespace_pattern: str | None = None
     structural_tag: str | None = None
+    enable_jump_decoding: bool | None = None
+    """Per-request opt-in for jump-forward decoding. Requires the server
+    to also enable it via StructuredOutputsConfig.enable_jump_decoding.
+    None/False = no FF tokens for this request; True = use FF when the
+    grammar forces deterministic tokens."""
 
     _backend: str | None = field(default=None, init=False)
     """CAUTION: Should only be set by Processor._validate_structured_output"""
@@ -801,6 +806,27 @@ class SamplingParams(
         structured_outputs_config: StructuredOutputsConfig | None,
         tokenizer: TokenizerLike | None,
     ) -> None:
+        # Per-request JD opt-in requires the server to also have
+        # enable_jump_decoding=true in --structured-outputs-config.
+        # llguidance only maintains the ff-token state when the server has
+        # opted in at startup; without it, advance_ff_tokens() returns []
+        # and the per-request flag would be silently no-op. Raise loudly so
+        # deployment-config mistakes surface as 4xx, not as missing speedups.
+        if (
+            self.structured_outputs is not None
+            and self.structured_outputs.enable_jump_decoding
+            and (
+                structured_outputs_config is None
+                or not structured_outputs_config.enable_jump_decoding
+            )
+        ):
+            raise ValueError(
+                "structured_outputs.enable_jump_decoding=True was set on this "
+                "request, but the server was not started with "
+                "--structured-outputs-config '{...,\"enable_jump_decoding\":true}'. "
+                "The flag would otherwise be silently ignored."
+            )
+
         if structured_outputs_config is None or self.structured_outputs is None:
             return
 

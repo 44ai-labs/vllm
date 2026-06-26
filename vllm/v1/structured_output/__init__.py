@@ -296,20 +296,66 @@ class StructuredOutputManager:
                 grammar = structured_output_request.grammar
                 apply_bitmask = self.should_fill_bitmask(request)
 
-                state_advancements = 0
                 req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
-                for token in itertools.chain(req_tokens, (-1,)):
-                    self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
-                    if token == -1:
-                        # Stop advancing the grammar once we hit a padding token.
-                        apply_bitmask = False
-                    if apply_bitmask and not grammar.is_terminated():
-                        accepted = grammar.accept_tokens(req_id, [token])
-                        assert accepted, (token, req_id, scheduled_spec_decode_tokens)
-                        state_advancements += 1
-                    cumulative_index += 1
-                if state_advancements > 0:
-                    grammar.rollback(state_advancements)
+
+                # Speculative-decode draft tokens are not yet committed and
+                # may be grammar-illegal (the drafter proposes blind). Walk a
+                # throwaway *copy* of the grammar through them so the
+                # committed matcher is never mutated -- this avoids the
+                # fragile, non-inverting accept-then-rollback over the live
+                # matcher and makes the per-position masks legal by
+                # construction. An illegal draft simply stops the walk
+                # (truncation): the masks already filled reject that draft
+                # position and the target decodes it under the grammar mask.
+                spec_grammar = (
+                    grammar.clone_for_speculation()
+                    if req_tokens and apply_bitmask
+                    else None
+                )
+                if spec_grammar is not None:
+                    advancing = apply_bitmask
+                    for token in itertools.chain(req_tokens, (-1,)):
+                        self._fill_bitmasks(
+                            ((spec_grammar, cumulative_index, advancing),)
+                        )
+                        if token == -1:
+                            # Padding token: stop advancing the grammar.
+                            advancing = False
+                        # Advance the throwaway copy; an illegal draft (consume
+                        # returns False) truncates the walk. Short-circuit keeps
+                        # accept_tokens from running once advancing is False.
+                        if (
+                            advancing
+                            and not spec_grammar.is_terminated()
+                            and not spec_grammar.accept_tokens(req_id, [token])
+                        ):
+                            advancing = False
+                        cumulative_index += 1
+                else:
+                    # No spec-decode tokens (or masking disabled): fall back to
+                    # the accept-then-rollback walk over the live matcher. With
+                    # no draft tokens there is nothing to roll back, so this is
+                    # a single fill at the committed state.
+                    state_advancements = 0
+                    for token in itertools.chain(req_tokens, (-1,)):
+                        self._fill_bitmasks(
+                            ((grammar, cumulative_index, apply_bitmask),)
+                        )
+                        if token == -1:
+                            # Stop advancing the grammar once we hit a padding
+                            # token.
+                            apply_bitmask = False
+                        if apply_bitmask and not grammar.is_terminated():
+                            accepted = grammar.accept_tokens(req_id, [token])
+                            assert accepted, (
+                                token,
+                                req_id,
+                                scheduled_spec_decode_tokens,
+                            )
+                            state_advancements += 1
+                        cumulative_index += 1
+                    if state_advancements > 0:
+                        grammar.rollback(state_advancements)
 
         bitmask_tensor = self._grammar_bitmask
         if cumulative_index < bitmask_tensor.shape[0]:
