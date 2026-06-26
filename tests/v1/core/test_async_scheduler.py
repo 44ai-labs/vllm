@@ -66,6 +66,40 @@ def test_stop_by_max_tokens(max_tokens: int):
     assert total_num_scheduled_tokens == expected_total_num_scheduled_tokens
 
 
+def test_async_per_request_spec_decode_opt_out():
+    """Per-request MTP opt-out must hold under async scheduling.
+
+    Regression for the async-scheduling gap: the sync gate lives in
+    ``update_draft_token_ids``, which the async path never calls.
+    ``AsyncScheduler._update_after_schedule`` must clear ``spec_token_ids`` for
+    opted-out requests so the next ``schedule()`` reserves no speculative slots for
+    them, while opted-in requests keep their placeholders.
+    """
+    scheduler = create_scheduler(async_scheduling=True, num_speculative_tokens=3)
+
+    # Separate create_requests calls so each request owns its SamplingParams.
+    opted_in = create_requests(num_requests=1, max_tokens=10, req_ids=["in"])[0]
+    opted_out = create_requests(num_requests=1, max_tokens=10, req_ids=["out"])[0]
+    opted_in.sampling_params.enable_speculative_decoding = True
+    opted_out.sampling_params.enable_speculative_decoding = False
+    scheduler.add_request(opted_in)
+    scheduler.add_request(opted_out)
+
+    # Prefill (no spec scheduled yet), then the first decode step. The prefill step's
+    # _update_after_schedule sets spec_token_ids per opt-in; the next schedule() acts
+    # on it. Only the prefill output is fed back, so no spec-output mocking is needed.
+    sched0 = scheduler.schedule()
+    scheduler.update_from_output(sched0, _make_model_runner_output(sched0))
+    sched1 = scheduler.schedule()
+
+    # The opt-in gate is reflected directly in spec_token_ids ...
+    assert opted_in.spec_token_ids == [-1, -1, -1]
+    assert opted_out.spec_token_ids == []
+    # ... and in what the next step actually schedules.
+    assert len(sched1.scheduled_spec_decode_tokens.get("in", [])) == 3
+    assert len(sched1.scheduled_spec_decode_tokens.get("out", [])) == 0
+
+
 def test_abort():
     scheduler = create_scheduler(async_scheduling=True)
     requests = create_requests(num_requests=10, max_tokens=20)

@@ -4628,8 +4628,13 @@ class GPUModelRunner(
         draft_after_bookkeeping = False
         if spec_config is not None:
             # Decide whether to run the drafter or zero out draft tokens.
-            input_fits_in_drafter = self._input_fits_in_drafter(
-                spec_decode_common_attn_metadata
+            # Per-request opt-in: when no scheduled request asked for spec
+            # decode, skip the drafter via the same zero-out path as an
+            # oversized input, so the no-spec case keeps baseline latency and
+            # no stale drafts get scheduled next step.
+            input_fits_in_drafter = (
+                self._input_fits_in_drafter(spec_decode_common_attn_metadata)
+                and self._any_request_opts_into_spec()
             )
             # Whether the drafter runs a GPU model forward (and thus carries
             # TP/EP/DP collectives), independent of padded-batch timing.
@@ -5006,6 +5011,28 @@ class GPUModelRunner(
         if not draft_probs_rows:
             return None
         return torch.cat(draft_probs_rows, dim=0).contiguous()
+
+    def _any_request_opts_into_spec(self) -> bool:
+        """Whether any request in the current batch opted into speculative decoding.
+
+        Per-request opt-in lives in ``SamplingParams.enable_speculative_decoding``
+        and mirrors the scheduler-side ``_request_opts_into_spec_decode`` gate. Under
+        async scheduling the scheduler cannot stop the worker from drafting, so
+        ``execute_model`` uses this to skip the drafter when no request wants it,
+        keeping the no-spec path at baseline latency. Short-circuits on the first
+        opted-in request.
+        """
+        for req_id in self.input_batch.req_ids:
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            sampling_params = req_state.sampling_params
+            if (
+                sampling_params is not None
+                and sampling_params.enable_speculative_decoding
+            ):
+                return True
+        return False
 
     def propose_draft_token_ids(
         self,

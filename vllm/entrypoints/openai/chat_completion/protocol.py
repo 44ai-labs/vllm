@@ -451,6 +451,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "len(token_texts) == len(token_ids) when both are requested."
         ),
     )
+    enable_speculative_decoding: bool | None = Field(
+        default=None,
+        description=(
+            "Per-request opt-in for speculative decoding. Requires the "
+            "server to have --speculative-config set. If unset/false, "
+            "proposer-produced drafts are discarded for this request."
+        ),
+    )
 
     return_assistant_tokens_mask: bool = Field(
         default=False,
@@ -738,6 +746,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             ),
             stream_interval=self.stream_interval,
             return_token_texts=bool(self.return_token_texts),
+            enable_speculative_decoding=self.enable_speculative_decoding,
             structured_outputs=self.extract_structured_outputs(),
             logit_bias=self.logit_bias,
             bad_words=self.bad_words,
