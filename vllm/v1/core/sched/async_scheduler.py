@@ -3,7 +3,7 @@
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.scheduler import Scheduler, _request_opts_into_spec_decode
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
@@ -32,7 +32,15 @@ class AsyncScheduler(Scheduler):
             request.num_output_placeholders += 1 + cur_num_spec_tokens
             # Add placeholders for the new draft/spec tokens.
             # We will update the actual spec token ids in the worker process.
-            request.spec_token_ids = self._spec_token_placeholders
+            # Per-request MTP opt-out: opted-out requests get no spec placeholders,
+            # so the next schedule() reserves no speculative slots for them. The sync
+            # path gates this in Scheduler.update_draft_token_ids, which async never
+            # calls; mirroring it here (before the next schedule()) keeps
+            # num_scheduled_tokens and KV allocation self-consistent.
+            if _request_opts_into_spec_decode(request):
+                request.spec_token_ids = self._spec_token_placeholders
+            else:
+                request.spec_token_ids = []
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]

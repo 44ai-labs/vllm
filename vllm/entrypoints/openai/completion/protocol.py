@@ -153,6 +153,14 @@ class CompletionRequest(OpenAIBaseModel):
             "len(token_texts) == len(token_ids) when both are requested."
         ),
     )
+    enable_speculative_decoding: bool | None = Field(
+        default=None,
+        description=(
+            "Per-request opt-in for speculative decoding. Requires the "
+            "server to have --speculative-config set. If unset/false, "
+            "proposer-produced drafts are discarded for this request."
+        ),
+    )
 
     cache_salt: str | None = Field(
         default=None,
@@ -329,6 +337,7 @@ class CompletionRequest(OpenAIBaseModel):
             if self.stream
             else RequestOutputKind.FINAL_ONLY,
             return_token_texts=bool(self.return_token_texts),
+            enable_speculative_decoding=self.enable_speculative_decoding,
             structured_outputs=self.structured_outputs,
             logit_bias=self.logit_bias,
             allowed_token_ids=self.allowed_token_ids,
