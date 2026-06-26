@@ -88,6 +88,26 @@ class StructuredOutputGrammar(ABC):
             bool: True if the process is terminated, False otherwise.
         """
 
+    def advance_ff_tokens(self) -> list[int]:
+        """Computes fast-forward (deterministic) tokens from the grammar.
+
+        Returns tokens that the grammar forces without needing model
+        inference. Default implementation returns empty list.
+        """
+        return []
+
+    def clone_for_speculation(self) -> "StructuredOutputGrammar | None":
+        """Return an independent copy of this grammar for speculative
+        advancement, or None if the backend cannot cheaply clone.
+
+        The copy is meant to be advanced through tentative
+        (speculative-decode draft) tokens and then discarded, so that the
+        committed grammar state is never mutated and no (potentially
+        non-inverting) rollback is required. Backends that return None
+        fall back to the accept-then-rollback walk.
+        """
+        return None
+
     @abstractmethod
     def reset(self):
         """
