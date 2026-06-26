@@ -313,12 +313,24 @@ class StructuredOutputManager:
                 simulated_buf: list[int] | None = None
                 history_len = 0
 
+                req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
+                # Drafts are uncommitted and may be grammar-illegal. When the
+                # backend can clone the matcher, walk a throwaway copy so the
+                # committed state is never mutated and no rollback (non-inverting
+                # for some grammars) is needed; otherwise keep the
+                # accept-then-rollback walk over the live matcher.
+                walk_grammar = grammar.clone_for_speculation() if req_tokens else None
+                use_clone = walk_grammar is not None
+                if walk_grammar is None:
+                    walk_grammar = grammar
                 state_advancements = 0
                 post_reasoning_end_in_window = False
-                req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
+                draft_walk_truncated = False
                 for i, token in enumerate(req_tokens):
-                    self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
-                    advance_grammar = apply_bitmask
+                    self._fill_bitmasks(
+                        ((walk_grammar, cumulative_index, apply_bitmask),)
+                    )
+                    advance_grammar = apply_bitmask and not draft_walk_truncated
                     if token == -1:
                         apply_bitmask = False
                         advance_grammar = False
@@ -343,10 +355,16 @@ class StructuredOutputManager:
                             apply_bitmask = True
                             advance_grammar = False
                             post_reasoning_end_in_window = True
-                    if advance_grammar and not grammar.is_terminated():
-                        accepted = grammar.accept_tokens(req_id, [token])
+                    if advance_grammar and not walk_grammar.is_terminated():
+                        accepted = (
+                            walk_grammar.accept_draft_tokens(req_id, [token]) == 1
+                        )
                         if accepted:
                             state_advancements += 1
+                        elif use_clone:
+                            # The row filled above already rejects this draft, so
+                            # nothing after it can be committed.
+                            draft_walk_truncated = True
                         elif not post_reasoning_end_in_window:
                             raise AssertionError(
                                 (token, req_id, scheduled_spec_decode_tokens)
@@ -366,9 +384,11 @@ class StructuredOutputManager:
                     #   reasoning_ended is only persisted later by
                     #   should_advance.
                     bonus_apply = self.should_fill_bitmask(request) or apply_bitmask
-                    self._fill_bitmasks(((grammar, cumulative_index, bonus_apply),))
+                    self._fill_bitmasks(
+                        ((walk_grammar, cumulative_index, bonus_apply),)
+                    )
                     cumulative_index += 1
-                if state_advancements > 0:
+                if not use_clone and state_advancements > 0:
                     grammar.rollback(state_advancements)
 
         bitmask_tensor = self._grammar_bitmask

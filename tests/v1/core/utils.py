@@ -13,6 +13,7 @@ from vllm.config import (
     ParallelConfig,
     SchedulerConfig,
     SpeculativeConfig,
+    StructuredOutputsConfig,
     VllmConfig,
 )
 from vllm.multimodal.inputs import (
@@ -70,6 +71,7 @@ def create_scheduler(
     ec_role: str | None = None,
     use_v2_model_runner: bool | None = None,
     kv_cache_spec: KVCacheSpec | None = None,
+    enable_jump_decoding: bool = False,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -162,6 +164,11 @@ def create_scheduler(
         else None
     )
 
+    structured_outputs_config = StructuredOutputsConfig(
+        backend="guidance" if enable_jump_decoding else "auto",
+        enable_jump_decoding=enable_jump_decoding,
+    )
+
     vllm_config = VllmConfig(
         scheduler_config=scheduler_config,
         model_config=model_config,
@@ -173,6 +180,7 @@ def create_scheduler(
         kv_transfer_config=kv_transfer_config,
         speculative_config=speculative_config,
         ec_transfer_config=ec_transfer_config,
+        structured_outputs_config=structured_outputs_config,
     )
     if kv_cache_spec is None:
         kv_cache_spec = FullAttentionSpec(

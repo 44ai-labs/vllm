@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.sched.scheduler import Scheduler, _request_opts_into_spec_decode
+from vllm.v1.core.sched.scheduler import (
+    Scheduler,
+    _assert_jd_cache_safe,
+    _request_opts_into_spec_decode,
+)
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
@@ -59,6 +64,16 @@ class AsyncScheduler(Scheduler):
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False
     ) -> tuple[list[int], bool]:
+        if request.jd_discard_pending > 0:
+            # Jump-forward tokens were emitted while this step was in
+            # flight: its sample is conditioned on a pre-jump context (the
+            # ff tokens were not part of its forward pass). Drop it; the
+            # position is re-decoded after the ff tokens are processed.
+            # num_output_placeholders was already released at ff-emission
+            # time, so no decrement here.
+            request.jd_discard_pending -= 1
+            return [], False
+
         status_before_update = request.status
         new_token_ids, stopped = super()._update_request_with_output(
             request, new_token_ids
@@ -72,7 +87,8 @@ class AsyncScheduler(Scheduler):
 
         # Cache the new tokens. Preempted requests should be skipped.
         if status_before_update == RequestStatus.RUNNING:
-            self.kv_cache_manager.cache_blocks(
-                request, request.num_computed_tokens - request.num_output_placeholders
-            )
+            num_to_cache = request.num_computed_tokens - request.num_output_placeholders
+            if envs.VLLM_JD_DEBUG_ASSERTS:
+                _assert_jd_cache_safe(request, num_to_cache)
+            self.kv_cache_manager.cache_blocks(request, num_to_cache)
         return new_token_ids, stopped
