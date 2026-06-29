@@ -4747,3 +4747,134 @@ def test_jd_discard_depth_invariant():
     req.jd_discard_pending = 2
     with pytest.raises(AssertionError):
         _assert_jd_discard_depth(req)
+
+
+def test_jd_prefill_match_invariant():
+    """A [prefill] decision must be decision-independent: the predicted span must
+    equal the actual forced span; a mismatch is a grammar bug (caught in debug)."""
+    from vllm.v1.core.sched.scheduler import _assert_jd_prefill_match
+
+    (req,) = create_requests(num_requests=1, num_tokens=8)
+    _assert_jd_prefill_match(req, [100, 101], [100, 101])  # match: ok
+    with pytest.raises(AssertionError):
+        _assert_jd_prefill_match(req, [100, 101], [100, 102])  # decision-dependent
+    with pytest.raises(AssertionError):
+        _assert_jd_prefill_match(req, [100, 101], [100])  # different length
+
+
+def _make_prefill_grammar(span: list[int], is_prefill: bool = True):
+    """Mock grammar at a [prefill] decision whose decision-independent forced span
+    is ``span`` (what compute_prefill_ff_tokens returns)."""
+    grammar = Mock()
+    grammar.is_terminated = Mock(return_value=False)
+    grammar.is_prefill_region = Mock(return_value=is_prefill)
+    grammar.compute_prefill_ff_tokens = Mock(return_value=span)
+    return grammar
+
+
+def _setup_prefill_predict_request(scheduler, request):
+    """A running request with an in-flight decision (placeholders>0), opted into JD,
+    positioned at a [prefill] decision -- the predict precondition."""
+    request.num_computed_tokens = request.num_tokens
+    request.status = RequestStatus.RUNNING
+    request.num_output_placeholders = 1
+    request.pending_prefill_pred = None
+    request.sampling_params.structured_outputs = Mock(enable_jump_decoding=True)
+    request.structured_output_request = _make_structured_output_request(
+        _make_prefill_grammar([100, 101])
+    )
+    scheduler.requests[request.request_id] = request
+    scheduler.running.append(request)
+
+
+def test_maybe_guaranteed_prefill_span_gated_off(monkeypatch):
+    """Off by default (env unset): no pre-schedule even at a [prefill] decision."""
+    monkeypatch.setenv("JD_GUARANTEED_PREFILL", "0")
+    scheduler = create_scheduler(async_scheduling=True, enable_jump_decoding=True)
+    scheduler.structured_output_manager.should_advance = Mock(return_value=True)
+    (req,) = create_requests(num_requests=1, max_tokens=20)
+    _setup_prefill_predict_request(scheduler, req)
+    assert scheduler._maybe_guaranteed_prefill_span(req) is None
+
+
+def test_maybe_guaranteed_prefill_span_detects_and_gates(monkeypatch):
+    """With the env on, the predict returns S_pred exactly when a request opted into
+    JD has an in-flight decision and its committed grammar is at a [prefill] region;
+    each missing precondition disables it."""
+    monkeypatch.setenv("JD_GUARANTEED_PREFILL", "1")
+    scheduler = create_scheduler(async_scheduling=True, enable_jump_decoding=True)
+    scheduler.structured_output_manager.should_advance = Mock(return_value=True)
+    (req,) = create_requests(num_requests=1, max_tokens=20)
+    _setup_prefill_predict_request(scheduler, req)
+
+    # All preconditions met -> the decision-independent span.
+    assert scheduler._maybe_guaranteed_prefill_span(req) == [100, 101]
+
+    # Not at a [prefill] decision -> None.
+    req.structured_output_request.grammar.is_prefill_region = Mock(return_value=False)
+    assert scheduler._maybe_guaranteed_prefill_span(req) is None
+    req.structured_output_request.grammar.is_prefill_region = Mock(return_value=True)
+
+    # No in-flight decision token D -> None.
+    req.num_output_placeholders = 0
+    assert scheduler._maybe_guaranteed_prefill_span(req) is None
+    req.num_output_placeholders = 1
+
+    # Already mid guaranteed-prefill -> don't stack another.
+    req.pending_prefill_pred = [100, 101]
+    assert scheduler._maybe_guaranteed_prefill_span(req) is None
+    req.pending_prefill_pred = None
+
+    # Not opted into jump decoding -> None.
+    req.sampling_params.structured_outputs = Mock(enable_jump_decoding=False)
+    assert scheduler._maybe_guaranteed_prefill_span(req) is None
+    req.sampling_params.structured_outputs = Mock(enable_jump_decoding=True)
+
+    # Empty forced span (not actually pre-schedulable) -> None.
+    req.structured_output_request.grammar.compute_prefill_ff_tokens = Mock(
+        return_value=[]
+    )
+    assert scheduler._maybe_guaranteed_prefill_span(req) is None
+
+
+def test_guaranteed_prefill_cache_boundary_excludes_inflight_span(monkeypatch):
+    """Regression (GPU-observed _assert_jd_cache_safe trip): during an in-flight
+    jd_guaranteed_prefill [D, S_pred] step, S's KV is computed (so it is counted in
+    num_computed_tokens) but S is not yet committed (num_tokens) -- it is appended
+    only later, at the S_pred == S_actual verify. The prefix-cache boundary must
+    exclude that in-flight span (len(pending_prefill_pred)), so a span a mismatch
+    would discard is never hashed into the prefix cache before the commit."""
+    monkeypatch.setenv("VLLM_JD_DEBUG_ASSERTS", "1")
+    scheduler = create_scheduler(async_scheduling=True, enable_jump_decoding=True)
+    (req,) = create_requests(num_requests=1, num_tokens=203, max_tokens=4096)
+    req.status = RequestStatus.RUNNING
+    req.discard_latest_async_tokens = False
+    # In-flight [D, S_pred]: num_computed_tokens includes D (1) + a 6-token forced
+    # span S. This update commits only the decision token D; S commits at the verify.
+    req.pending_prefill_pred = [1, 2, 3, 4, 5, 6]
+    req.num_computed_tokens = 211
+    req.num_output_placeholders = 2
+
+    captured: list[int] = []
+    scheduler.kv_cache_manager.cache_blocks = Mock(
+        side_effect=lambda r, n: captured.append(n)
+    )
+
+    # Commit D. Without the fix num_to_cache would be 211 - 1 = 210, past the
+    # committed length 204 -> _assert_jd_cache_safe raises. With the fix the 6
+    # uncommitted S tokens are excluded: 211 - 1 - 6 == 204 == num_tokens.
+    _, stopped = scheduler._update_request_with_output(req, [999])
+    assert not stopped
+    assert req.num_tokens == 204  # D committed; S not yet
+    assert captured == [204]
+
+    # After the verify commits S and clears pending_prefill_pred, the next step
+    # caches normally -- S's blocks are now in the committed range.
+    req.append_output_token_ids([1, 2, 3, 4, 5, 6])  # S committed at verify
+    req.pending_prefill_pred = None
+    req.num_output_placeholders = 1  # only the post-S sample is still in flight
+    assert req.num_tokens == 210
+    captured.clear()
+    scheduler._update_request_with_output(req, [777])  # post-S sample arrives
+    assert req.num_tokens == 211
+    assert captured == [211]  # 211 - 0 == 211 == num_tokens; S's blocks cached now

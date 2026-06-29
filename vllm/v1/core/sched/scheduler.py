@@ -120,8 +120,10 @@ def _assert_jd_cache_safe(request: Request, num_to_cache: int) -> None:
     caching. Caching must therefore stay at or below the committed token length, so a
     block whose KV belongs to the discarded/uncomputed span is never hashed into the
     prefix cache and later reused as a stale prefix. ``num_to_cache`` is the boundary
-    handed to ``cache_blocks`` (``num_computed_tokens - num_output_placeholders``); in
-    steady decode it equals ``num_tokens`` and after a jump it is strictly below.
+    handed to ``cache_blocks`` (``num_computed_tokens - num_output_placeholders``,
+    minus the in-flight ``pending_prefill_pred`` span for a guaranteed-prefill
+    ``[D, S_pred]`` step whose forced S is computed but not yet committed/verified);
+    in steady decode it equals ``num_tokens`` and after a jump it is strictly below.
     Gated by VLLM_JD_DEBUG_ASSERTS (off in production).
     """
     assert 0 <= num_to_cache <= request.num_tokens, (
@@ -147,6 +149,28 @@ def _assert_jd_discard_depth(request: Request) -> None:
         f"jd_discard_pending={request.jd_discard_pending} > 1 for request "
         f"{request.request_id}: the batch_queue depth-2 single-in-flight assumption "
         f"no longer holds (pipeline parallelism enabled?)."
+    )
+
+
+def _assert_jd_prefill_match(
+    request: Request, s_pred: list[int], s_actual: list[int]
+) -> None:
+    """Assert a jd_guaranteed_prefill prediction matched the actual forced span.
+
+    A ``[prefill]`` annotation asserts the forced span after the decision is
+    decision-independent, so the span S_pred predicted (from one allowed branch) at
+    schedule time must equal the actual span S_actual the committed decision forces.
+    A mismatch means the grammar's ``[prefill]`` rule is in fact decision-dependent
+    (or wrongly annotated): correctness is still safe (the engine falls back to the
+    discard-redo), but it is a wasted pre-schedule and a grammar bug worth catching.
+    Gated by VLLM_JD_DEBUG_ASSERTS (off in production), and only checked when the
+    span was not truncated by a stop.
+    """
+    assert s_pred == s_actual, (
+        f"jd_guaranteed_prefill prediction mismatch for request "
+        f"{request.request_id}: predicted S_pred={s_pred!r} but the committed "
+        f"decision forced S_actual={s_actual!r}; the [prefill] rule is not "
+        f"decision-independent."
     )
 
 
@@ -432,6 +456,9 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        # jd_guaranteed_prefill: req_id -> S_pred, the decision-independent forced
+        # span pre-scheduled after the in-flight decision token D ([D, S_pred]).
+        guaranteed_prefill_tokens: dict[str, list[int]] = {}
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -459,20 +486,60 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
-            num_new_tokens = (
-                request.num_tokens_with_spec
-                + request.num_output_placeholders
-                - request.num_computed_tokens
-            )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget)
+            # jd_guaranteed_prefill: if this running request opted into jump
+            # decoding, has an in-flight decision token D (num_output_placeholders
+            # > 0), and its committed grammar is at a `[prefill]` decision (a
+            # decision-independent forced span S follows), lay this in-flight step
+            # out as the chunk [D, S_pred] instead of the plain decode that the
+            # async jump path would otherwise discard. D arrives via the async
+            # sampled-token scatter; S_pred is the grammar's predicted span. The
+            # decision is verified at update_from_output (S_pred == S_actual); on a
+            # mismatch the step is discarded and the validated redo runs, so a wrong
+            # prediction costs a wasted prefill, never correctness.
+            guaranteed_prefill_span = self._maybe_guaranteed_prefill_span(request)
 
-            # Make sure the input position does not exceed the max model len.
-            # This is necessary when using spec decoding.
-            num_new_tokens = min(
-                num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
-            )
+            if guaranteed_prefill_span is not None:
+                # [D, S_pred]: one decision token + the forced span, no draft verify.
+                # Only commit to this layout if the whole chunk fits the budget and
+                # the model-len bound; otherwise fall back to a normal decode (and
+                # thus the discard-redo), since a truncated span would corrupt S.
+                chunk_len = 1 + len(guaranteed_prefill_span)
+                fits = (
+                    chunk_len <= token_budget
+                    and chunk_len
+                    <= self.max_model_len - 1 - request.num_computed_tokens
+                )
+                if fits:
+                    num_new_tokens = chunk_len
+                    # No draft verify on a prefill step; the async _update_after_
+                    # schedule re-sets spec_token_ids for the *next* step's drafts.
+                    request.spec_token_ids = []
+                    request.pending_prefill_pred = guaranteed_prefill_span
+                    guaranteed_prefill_tokens[request.request_id] = (
+                        guaranteed_prefill_span
+                    )
+                else:
+                    guaranteed_prefill_span = None
+
+            if guaranteed_prefill_span is None:
+                num_new_tokens = (
+                    request.num_tokens_with_spec
+                    + request.num_output_placeholders
+                    - request.num_computed_tokens
+                )
+                if (
+                    0
+                    < self.scheduler_config.long_prefill_token_threshold
+                    < num_new_tokens
+                ):
+                    num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+                num_new_tokens = min(num_new_tokens, token_budget)
+
+                # Make sure the input position does not exceed the max model len.
+                # This is necessary when using spec decoding.
+                num_new_tokens = min(
+                    num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
+                )
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -991,6 +1058,7 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
             jump_forward_tokens=jump_forward_tokens,
+            guaranteed_prefill_tokens=guaranteed_prefill_tokens,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1041,6 +1109,39 @@ class Scheduler(SchedulerInterface):
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
+
+    def _maybe_guaranteed_prefill_span(self, request: Request) -> list[int] | None:
+        """jd_guaranteed_prefill predict.
+
+        If `request` opted into jump decoding, has an in-flight decision token D
+        (``num_output_placeholders > 0``), and its committed grammar is at a
+        ``[prefill]`` decision with a non-empty, decision-independent forced span,
+        return that span S_pred so the in-flight step can be laid out as
+        ``[D, S_pred]`` instead of a plain decode that the async jump path would
+        discard. Returns None (no pre-schedule) otherwise. Gated by
+        JD_GUARANTEED_PREFILL; the prediction is always verified against the actual
+        post-decision ff span in update_from_output, so a wrong ``[prefill]``
+        annotation can only waste a prefill, never corrupt output.
+        """
+        if not envs.JD_GUARANTEED_PREFILL:
+            return None
+        # Need an in-flight decision token D to fold into the chunk, and don't
+        # stack a second guaranteed prefill while one is awaiting verification.
+        if request.num_output_placeholders <= 0 or request.pending_prefill_pred:
+            return None
+        if not _request_opts_into_jump_decoding(request):
+            return None
+        if not self.structured_output_manager.should_advance(request):
+            return None
+        sor = request.structured_output_request
+        if sor is None or sor.grammar is None:
+            return None
+        grammar = sor.grammar
+        if grammar.is_terminated() or not grammar.is_prefill_region():
+            return None
+        # Clone-walk in the grammar (one allowed decision branch -> compute_ff);
+        # empty when not actually a pre-schedulable decision or non-canonical.
+        return grammar.compute_prefill_ff_tokens() or None
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -1552,33 +1653,62 @@ class Scheduler(SchedulerInterface):
                             if stopped:
                                 ff_tokens = ff_tokens[: i + 1]
                                 break
-                        self.pending_ff_tokens[req_id] = ff_tokens
+                        # jd_guaranteed_prefill verify: if the in-flight step was
+                        # pre-scheduled as [D, S_pred] and S_pred == S_actual (this
+                        # ff span), that step already prefilled the span correctly --
+                        # it IS the redo, done a step early -- so keep it (no discard)
+                        # and do not queue another redo. A stop truncates ff_tokens
+                        # above, so an over-prefilled S_pred then no longer matches
+                        # and we fall back. On any mismatch we take the validated
+                        # discard-and-redo below, discarding the wrong in-flight step.
+                        prefill_pred = request.pending_prefill_pred
+                        request.pending_prefill_pred = None
+                        if (
+                            envs.VLLM_JD_DEBUG_ASSERTS
+                            and prefill_pred is not None
+                            and not stopped
+                        ):
+                            # A [prefill] decision must be decision-independent: the
+                            # predicted span must equal the actual forced span.
+                            _assert_jd_prefill_match(request, prefill_pred, ff_tokens)
+                        guaranteed_hit = (
+                            prefill_pred is not None
+                            and not stopped
+                            and prefill_pred == ff_tokens
+                        )
 
-                        # Async: an in-flight step was forwarded before these
-                        # ff tokens existed, so its sample is conditioned on
-                        # the pre-jump context. Discard it and re-decode after
-                        # the ff tokens are committed. Release the placeholders
-                        # now so the next schedule() lays out positions without
-                        # the dead slots; the async scheduler drops the stale
-                        # sample on arrival.
-                        if not stopped and request.num_output_placeholders > 0:
-                            # Batch-queue depth 2: at most one step in
-                            # flight; its output arrives in one update.
-                            request.jd_discard_pending += 1
-                            if envs.VLLM_JD_DEBUG_ASSERTS:
-                                _assert_jd_discard_depth(request)
-                            request.num_output_placeholders = 0
-                            # The in-flight step's chunk also covered K draft
-                            # positions where the ff tokens now belong, counted
-                            # as computed by schedule(). Mark them uncomputed so
-                            # the next schedule() re-runs the full ff span
-                            # through the target, and drop the dead spec
-                            # placeholders.
-                            request.num_computed_tokens = min(
-                                request.num_computed_tokens,
-                                request.num_tokens - len(ff_tokens),
-                            )
-                            request.spec_token_ids = []
+                        if not guaranteed_hit:
+                            self.pending_ff_tokens[req_id] = ff_tokens
+
+                            # Async: an in-flight step was forwarded before these
+                            # ff tokens existed, so its sample is conditioned on
+                            # the pre-jump context. Discard it and re-decode after
+                            # the ff tokens are committed. Release the placeholders
+                            # now so the next schedule() lays out positions without
+                            # the dead slots; the async scheduler drops the stale
+                            # sample on arrival.
+                            if not stopped and request.num_output_placeholders > 0:
+                                # Batch-queue depth 2: at most one step in
+                                # flight; its output arrives in one update.
+                                request.jd_discard_pending += 1
+                                if envs.VLLM_JD_DEBUG_ASSERTS:
+                                    _assert_jd_discard_depth(request)
+                                request.num_output_placeholders = 0
+                                # The in-flight step's chunk also covered K draft
+                                # positions where the ff tokens now belong, counted
+                                # as computed by schedule(). Mark them uncomputed so
+                                # the next schedule() re-runs the full ff span
+                                # through the target, and drop the dead spec
+                                # placeholders.
+                                request.num_computed_tokens = min(
+                                    request.num_computed_tokens,
+                                    request.num_tokens - len(ff_tokens),
+                                )
+                                request.spec_token_ids = []
+                        # guaranteed_hit: the [D, S_pred] chunk's KV (D + S) and its
+                        # post-span sample are correct, and num_computed_tokens /
+                        # num_output_placeholders already account for that chunk from
+                        # schedule time -- so leave them untouched and do not re-queue.
 
                         # Extend logprobs for ff_tokens: each is
                         # deterministic (logprob=0, all others=-inf),
