@@ -149,6 +149,10 @@ class ParserEngine(Parser):
     def reasoning_end_str(self) -> str | None:
         return self.parser_engine_config.terminals.get("THINK_END")
 
+    @property
+    def reasoning_end_token_id(self) -> int | None:
+        return self._reasoning_end_token_id
+
     @cached_property
     def vocab(self) -> dict[str, int]:
         return self.model_tokenizer.get_vocab()

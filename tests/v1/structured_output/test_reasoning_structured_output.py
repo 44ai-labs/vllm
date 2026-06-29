@@ -258,3 +258,40 @@ class TestReasoningStructuredOutput:
 
         # Should return True since reasoning has ended
         assert result is True
+
+    def test_grammar_advance_token_ids_drops_control_tokens(
+        self,
+        manager_with_reasoner,
+        mock_request_with_structured_output,
+    ):
+        """Stop tokens and the reasoning-end delimiter are dropped before the
+        FSM advances; constrained-output tokens are kept."""
+        request = mock_request_with_structured_output
+        request.sampling_params = Mock()
+        request.sampling_params.all_stop_token_ids = {106}
+        reasoner = Mock()
+        reasoner.reasoning_end_token_id = 200
+        request.structured_output_request.reasoner = reasoner
+
+        assert manager_with_reasoner.grammar_advance_token_ids(
+            request, [200, 5, 6, 106]
+        ) == [5, 6]
+
+    def test_grammar_advance_token_ids_keeps_content(
+        self,
+        manager_with_reasoner,
+        mock_request_with_structured_output,
+    ):
+        """Without control tokens the sampled tokens pass through unchanged."""
+        request = mock_request_with_structured_output
+        request.sampling_params = Mock()
+        request.sampling_params.all_stop_token_ids = set()
+        reasoner = Mock()
+        reasoner.reasoning_end_token_id = None
+        request.structured_output_request.reasoner = reasoner
+
+        assert manager_with_reasoner.grammar_advance_token_ids(request, [5, 6, 7]) == [
+            5,
+            6,
+            7,
+        ]

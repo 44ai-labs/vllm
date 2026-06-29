@@ -2911,6 +2911,9 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.connector = None
     scheduler.structured_output_manager = Mock()
     scheduler.structured_output_manager.should_advance.return_value = True
+    scheduler.structured_output_manager.grammar_advance_token_ids.side_effect = (
+        lambda req, token_ids: token_ids
+    )
     scheduler.requests = {request.request_id: request}
     scheduler.running = [request]
     scheduler.waiting = Mock()
@@ -2969,6 +2972,139 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     assert engine_core_output.request_id == request.request_id
     assert engine_core_output.new_token_ids == [123]
     assert engine_core_output.finish_reason == FinishReason.ERROR
+
+
+def _make_structured_output_manager(reasoner_cls=None):
+    vllm_config = Mock()
+    vllm_config.model_config.skip_tokenizer_init = True
+    vllm_config.model_config.get_vocab_size.return_value = 50000
+    vllm_config.scheduler_config.max_num_seqs = 8
+    vllm_config.parallel_config.distributed_executor_backend = "mp"
+    vllm_config.structured_outputs_config.reasoning_parser = None
+    vllm_config.structured_outputs_config.reasoning_parser_plugin = None
+    vllm_config.structured_outputs_config.enable_in_reasoning = False
+    vllm_config.speculative_config = None
+    manager = StructuredOutputManager(vllm_config)
+    manager.reasoner_cls = reasoner_cls
+    manager.tokenizer = Mock()
+    return manager
+
+
+def _run_structured_output_step(manager, request, sampled_token_ids):
+    scheduler = object.__new__(Scheduler)
+    scheduler.perf_metrics = None
+    scheduler.connector = None
+    scheduler.structured_output_manager = manager
+    scheduler.requests = {request.request_id: request}
+    scheduler.running = [request]
+    scheduler.waiting = Mock()
+    scheduler.kv_cache_manager = Mock()
+    scheduler.kv_cache_manager.take_events.return_value = None
+    scheduler.kv_event_publisher = Mock()
+    scheduler.finished_req_ids = set()
+    scheduler.finished_req_ids_dict = None
+    scheduler.vllm_config = Mock()
+    scheduler.vllm_config.model_config.enable_return_routed_experts = False
+    scheduler.enable_return_routed_experts = False
+    scheduler.recompute_kv_load_failures = False
+    scheduler.defer_block_free = False
+    scheduler.make_stats = Mock(return_value=None)
+    scheduler.max_model_len = 128
+
+    def free_request(req: Request, delay_free_blocks: bool = False):
+        scheduler.finished_req_ids.add(req.request_id)
+        scheduler.requests.pop(req.request_id, None)
+        return None
+
+    scheduler._free_request = Mock(side_effect=free_request)
+
+    output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: len(sampled_token_ids)},
+        total_num_scheduled_tokens=len(sampled_token_ids),
+        scheduled_encoder_inputs={},
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+    model_runner_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[sampled_token_ids],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(output, model_runner_output)
+
+
+def _structured_output_request(sampling_params):
+    sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
+    request = Request(
+        request_id="0",
+        prompt_token_ids=[0, 1],
+        mm_features=None,
+        sampling_params=sampling_params,
+        pooling_params=None,
+    )
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = request.num_tokens
+    grammar = Mock()
+    grammar.accept_tokens.return_value = False
+    request.structured_output_request.grammar = grammar
+    return request, grammar
+
+
+def test_structured_output_fsm_not_advanced_over_stop_token():
+    # A model stop token (e.g. a turn-end token that is not the matcher's eos)
+    # can be sampled alongside constrained output under speculative decoding.
+    # It is not part of the grammar language, so advancing the FSM over it must
+    # not abort the request.
+    stop_token_id = EOS_TOKEN_ID + 1
+    manager = _make_structured_output_manager()
+    request, grammar = _structured_output_request(
+        SamplingParams(
+            max_tokens=16,
+            stop_token_ids=[stop_token_id],
+            structured_outputs=StructuredOutputsParams(regex="[0-9]+"),
+        )
+    )
+
+    _run_structured_output_step(manager, request, [stop_token_id])
+
+    assert request.status == RequestStatus.FINISHED_STOPPED
+    grammar.accept_tokens.assert_not_called()
+
+
+def test_structured_output_fsm_not_advanced_over_reasoning_end_token():
+    # The reasoning-end delimiter can be sampled alongside the first answer
+    # tokens under speculative decoding once reasoning has ended. It delimits
+    # the reasoning stream rather than the constrained answer, so advancing the
+    # FSM over it must not abort the request.
+    reasoning_end_token_id = 200
+
+    class _StubReasoner:
+        reasoning_end_token_id = 200
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+    manager = _make_structured_output_manager(reasoner_cls=_StubReasoner)
+    request, grammar = _structured_output_request(
+        SamplingParams(
+            max_tokens=16,
+            structured_outputs=StructuredOutputsParams(regex="[0-9]+"),
+        )
+    )
+    request.structured_output_request.reasoning_ended = True
+    request.structured_output_request.reasoner = _StubReasoner()
+
+    _run_structured_output_step(manager, request, [reasoning_end_token_id])
+
+    assert request.status == RequestStatus.RUNNING
+    grammar.accept_tokens.assert_not_called()
 
 
 @pytest.mark.parametrize("use_v2_model_runner", [False, True])
