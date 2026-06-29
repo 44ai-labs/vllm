@@ -111,6 +111,28 @@ class StructuredOutputManager:
             )
         return structured_req.reasoner
 
+    def grammar_advance_token_ids(
+        self, request: "Request", new_token_ids: list[int]
+    ) -> list[int]:
+        """Drop generation-control tokens before advancing the FSM.
+
+        Stop tokens and the reasoning-end delimiter can be sampled alongside
+        constrained output (e.g. batched with answer tokens under speculative
+        decoding) but are not part of the grammar language; advancing the FSM
+        over them would reject an otherwise valid request. Other special tokens
+        (e.g. tool-call delimiters) are deliberately left in place: a
+        structural-tag grammar models them and must advance over them.
+        """
+        control_token_ids: set[int] = set()
+        if request.sampling_params is not None:
+            control_token_ids.update(request.sampling_params.all_stop_token_ids)
+        reasoner = self._get_reasoner(request)
+        if reasoner is not None and reasoner.reasoning_end_token_id is not None:
+            control_token_ids.add(reasoner.reasoning_end_token_id)
+        if not control_token_ids:
+            return new_token_ids
+        return [tid for tid in new_token_ids if tid not in control_token_ids]
+
     def grammar_init(self, request: "Request") -> None:
         if request.structured_output_request is None:
             return
