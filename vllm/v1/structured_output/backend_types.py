@@ -96,6 +96,21 @@ class StructuredOutputGrammar(ABC):
         """
         return []
 
+    def is_prefill_region(self) -> bool:
+        """Whether the next token is a pre-schedulable decision (a ``[prefill]``
+        grammar annotation) after which a decision-independent forced span follows.
+        Used by jd_guaranteed_prefill to pre-schedule that span. Backends without the
+        annotation return False (feature inert). Default returns False.
+        """
+        return False
+
+    def compute_prefill_ff_tokens(self) -> list[int]:
+        """The decision-independent forced span after a ``[prefill]`` decision,
+        discovered on a throwaway grammar copy without advancing the committed
+        grammar. Default implementation returns empty list (feature inert).
+        """
+        return []
+
     def clone_for_speculation(self) -> "StructuredOutputGrammar | None":
         """Return an independent copy of this grammar for speculative
         advancement, or None if the backend cannot cheaply clone.
