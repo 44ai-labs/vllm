@@ -1829,13 +1829,25 @@ class Scheduler(SchedulerInterface):
                         request, new_token_ids
                     )
                 )
-                if advance_token_ids and not grammar.accept_tokens(
-                    req_id, advance_token_ids
+                # Stop tokens and the reasoning-end delimiter can still be
+                # committed alongside grammar content under spec decode; they are
+                # not part of the constrained language and llguidance cannot parse
+                # a special token (its 0xFF marker byte fails the content parse),
+                # so advancing over them would terminate a valid request.
+                # Tool-call / structural-tag specials are deliberately kept: a
+                # structural-tag grammar models them.
+                grammar_token_ids = (
+                    self.structured_output_manager.grammar_advance_token_ids(
+                        request, advance_token_ids
+                    )
+                )
+                if grammar_token_ids and not grammar.accept_tokens(
+                    req_id, grammar_token_ids
                 ):
                     logger.error(
                         "Unexpected: grammar rejected tokens %s for request %s. "
                         "Terminating request.",
-                        advance_token_ids,
+                        grammar_token_ids,
                         req_id,
                     )
                     request.status = RequestStatus.FINISHED_ERROR
