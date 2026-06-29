@@ -1359,14 +1359,31 @@ class Scheduler(SchedulerInterface):
             if new_token_ids and self.structured_output_manager.should_advance(request):
                 struct_output_request = request.structured_output_request
                 assert struct_output_request is not None
-                assert struct_output_request.grammar is not None
-                if not struct_output_request.grammar.accept_tokens(  # type: ignore[union-attr]
-                    req_id, new_token_ids
+                grammar = struct_output_request.grammar
+                assert grammar is not None
+                # Generation-control tokens are not part of the constrained
+                # language and must not be advanced into the grammar: stop
+                # tokens end the sequence, and a reasoning model's end delimiter
+                # (e.g. Gemma-4 <channel|>) is out-of-band. Under spec decode
+                # such a token can be committed batched with answer tokens and
+                # reach here; the matcher cannot parse it (its 0xFF marker byte
+                # fails the content parse) and would reject it, terminating the
+                # request. Tool-call / structural-tag special tokens are
+                # deliberately NOT dropped — the grammar models them and must
+                # advance over them. Only a genuine content-token rejection
+                # stays a hard error.
+                grammar_token_ids = (
+                    self.structured_output_manager.grammar_advance_token_ids(
+                        request, new_token_ids
+                    )
+                )
+                if grammar_token_ids and not grammar.accept_tokens(
+                    req_id, grammar_token_ids
                 ):
                     logger.error(
                         "Unexpected: grammar rejected tokens %s for request %s. "
                         "Terminating request.",
-                        new_token_ids,
+                        grammar_token_ids,
                         req_id,
                     )
                     request.status = RequestStatus.FINISHED_ERROR

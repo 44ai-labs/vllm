@@ -57,6 +57,16 @@ class ReasoningParser:
         """
         return None
 
+    @property
+    def reasoning_end_token_id(self) -> int | None:
+        """Token id of the reasoning-end delimiter, when it is a single token.
+
+        Lets the structured-output FSM skip the closing reasoning delimiter,
+        which is not part of the constrained language. Returns None when the
+        boundary cannot be expressed as a single token.
+        """
+        return None
+
     @abstractmethod
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         """
