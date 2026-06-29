@@ -214,6 +214,24 @@ class GuidanceGrammar(StructuredOutputGrammar):
             self.check_error()
         return ff_tokens
 
+    def is_prefill_region(self) -> bool:
+        """Whether the next token is a ``[prefill]``-annotated decision, after which
+        a decision-independent forced span follows (the jd_guaranteed_prefill gate)."""
+        if self.ll_matcher.is_stopped():
+            return False
+        return self.ll_matcher.is_prefill_region()
+
+    def compute_prefill_ff_tokens(self) -> list[int]:
+        """The decision-independent forced span S_pred after a ``[prefill]`` decision,
+        computed on a throwaway matcher clone so the live matcher is not advanced.
+        Lets the engine pre-schedule ``[D, S_pred]`` before the decision D is sampled;
+        it is still verified against the actual post-decision ff span, so a wrong
+        annotation costs a wasted pre-schedule, not correctness. Empty when not at a
+        prefill decision."""
+        if self.ll_matcher.is_stopped():
+            return []
+        return self.ll_matcher.compute_prefill_ff_tokens()
+
     def validate_tokens(self, tokens: list[int]) -> list[int]:
         """Checks if the list of tokens are accepted by the parser in sequence.
         Will not advance the parser.
