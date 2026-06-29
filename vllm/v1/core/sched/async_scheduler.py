@@ -88,6 +88,18 @@ class AsyncScheduler(Scheduler):
         # Cache the new tokens. Preempted requests should be skipped.
         if status_before_update == RequestStatus.RUNNING:
             num_to_cache = request.num_computed_tokens - request.num_output_placeholders
+            # jd_guaranteed_prefill: while a [D, S_pred] step is in flight, S's KV
+            # is computed (so it is counted in num_computed_tokens) but S is neither
+            # committed (num_tokens) nor a sampled placeholder -- it is appended to
+            # the output only later in update_from_output, after the S_pred ==
+            # S_actual verify. Exclude that span from the cache boundary so a span a
+            # mismatch will discard is never hashed into the prefix cache before the
+            # commit. pending_prefill_pred is set at schedule and cleared at that
+            # verify, so it is non-empty exactly for this in-flight window (and only
+            # under async, where guaranteed prefill runs); S's blocks are cached on
+            # the next step, once num_tokens has caught up.
+            if request.pending_prefill_pred:
+                num_to_cache -= len(request.pending_prefill_pred)
             if envs.VLLM_JD_DEBUG_ASSERTS:
                 _assert_jd_cache_safe(request, num_to_cache)
             self.kv_cache_manager.cache_blocks(request, num_to_cache)

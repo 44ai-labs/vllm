@@ -1557,6 +1557,35 @@ class GPUModelRunner(
                 del req_state.output_token_ids[num_output_tokens - len(ff_tokens) :]
                 req_state.output_token_ids.extend(ff_tokens)
 
+            # jd_guaranteed_prefill: pre-write the decision-independent forced span
+            # S_pred into the chunk after the in-flight decision token D, so the
+            # [D, S_pred] mini-prefill computes D's and S's KV in one step and only
+            # the post-S position is sampled (a spec-less chunk -> a single logits
+            # index at the chunk end). D arrives at the chunk start via the async
+            # sampled-token scatter; S_pred occupies the slots right after it. The
+            # anchor is the ground-truth chunk position: input_ids is index_select'd
+            # from token_ids_cpu at [num_computed_tokens : +num_scheduled], so
+            # pos_D == num_computed_tokens_cpu[req_index] and S_pred starts at
+            # pos_D + 1. (num_tokens_no_spec is deliberately NOT used here -- under
+            # async it can sit at the pre-D boundary, which would shift the span.)
+            # The scheduler verifies S_pred == S_actual and discards this step via
+            # the normal redo on a mismatch, so a wrong [prefill] span costs a
+            # wasted prefill, never correctness. num_tokens_no_spec is left untouched
+            # (like the spec-draft write): D and S commit scheduler-side at the
+            # verify and advance num_tokens_no_spec at the next step's token write.
+            s_pred = scheduler_output.guaranteed_prefill_tokens.get(req_id)
+            if s_pred:
+                pos_d = int(self.input_batch.num_computed_tokens_cpu[req_index])
+                gp_start = pos_d + 1
+                gp_end = gp_start + len(s_pred)
+                assert gp_end <= self.max_model_len, (
+                    f"jd_guaranteed_prefill span exceeds max_model_len "
+                    f"({gp_end} > {self.max_model_len}) for request {req_id}."
+                )
+                self.input_batch.token_ids_cpu[req_index, gp_start:gp_end] = s_pred
+                # Mark as token IDs (not embeddings), matching the ff/spec writes.
+                self.input_batch.is_token_ids[req_index, gp_start:gp_end] = True
+
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
         for request in reqs_to_add:
@@ -1881,25 +1910,39 @@ class GPUModelRunner(
             prev_indices.append(prev_index)
             # We need to compute the flattened input_ids index of the
             # last token in each common request.
-            draft_len = len(scheduled_spec_tokens.get(req_id, ()))
-            total_num_spec_tokens += draft_len
             flattened_index = cu_num_tokens[cur_index].item() - 1
-            # example: cu_num_tokens = [2, 5, 8], draft_tokens = [1, 2, 2]
-            # sample_flattened_indices = [0, 2, 5]
-            # spec_flattened_indices = [1,   3, 4,    6, 7]
-            sample_flattened_indices.append(flattened_index - draft_len)
-            spec_flattened_indices.extend(
-                range(flattened_index - draft_len + 1, flattened_index + 1)
-            )
-            start = prev_index * self.prev_num_spec_tokens
-            # prev_draft_token_indices is used to find which draft_tokens_id
-            # should be copied to input_ids
-            # example: prev draft_tokens_id [[1,2], [3,4], [5, 6]]
-            # flatten draft_tokens_id [1,2,3,4,5,6]
-            # draft_len of each request [1, 2, 1]
-            # then prev_draft_token_indices is [0,   2, 3,   4]
-            prev_draft_token_indices.extend(range(start, start + draft_len))
-            common_indices_match &= prev_index == flattened_index
+            gp_span = scheduler_output.guaranteed_prefill_tokens.get(req_id)
+            if gp_span:
+                # jd_guaranteed_prefill chunk [D, S_pred]: the async sampled token D
+                # goes to the chunk START (flattened_index - len(S_pred)), not
+                # last-minus-drafts. S_pred is read from token_ids_cpu (written in
+                # _update_states), so there is NO draft scatter for this request --
+                # its slots must not be overwritten. A [D, S] chunk is also not a
+                # clean 1-token-per-req decode permutation, so disable the
+                # single-slice common-case copy below. (S_pred is not spec, so it is
+                # not added to total_num_spec_tokens -- it rides the index_select
+                # copy_to_gpu path like ordinary token_ids_cpu content.)
+                sample_flattened_indices.append(flattened_index - len(gp_span))
+                common_indices_match = False
+            else:
+                draft_len = len(scheduled_spec_tokens.get(req_id, ()))
+                total_num_spec_tokens += draft_len
+                # example: cu_num_tokens = [2, 5, 8], draft_tokens = [1, 2, 2]
+                # sample_flattened_indices = [0, 2, 5]
+                # spec_flattened_indices = [1,   3, 4,    6, 7]
+                sample_flattened_indices.append(flattened_index - draft_len)
+                spec_flattened_indices.extend(
+                    range(flattened_index - draft_len + 1, flattened_index + 1)
+                )
+                start = prev_index * self.prev_num_spec_tokens
+                # prev_draft_token_indices is used to find which draft_tokens_id
+                # should be copied to input_ids
+                # example: prev draft_tokens_id [[1,2], [3,4], [5, 6]]
+                # flatten draft_tokens_id [1,2,3,4,5,6]
+                # draft_len of each request [1, 2, 1]
+                # then prev_draft_token_indices is [0,   2, 3,   4]
+                prev_draft_token_indices.extend(range(start, start + draft_len))
+                common_indices_match &= prev_index == flattened_index
             max_flattened_index = max(max_flattened_index, flattened_index)
 
         num_common_tokens = len(sample_flattened_indices)
