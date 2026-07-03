@@ -698,6 +698,15 @@ class DelegatingParser(Parser):
                 delta_text = current_text
                 delta_token_ids = current_token_ids
 
+            # A multi-token delta (spec/jump decoding) can carry the tail of
+            # the reasoning stream AND the first content tokens in one step.
+            # The reasoning extracted above must survive the reassignment of
+            # delta_message by the tool parser below.
+            # Backport of upstream #45413 (reasoning_from_this_batch).
+            reasoning_from_this_batch = (
+                delta_message.reasoning if delta_message else None
+            )
+
             delta_message, state.function_name_returned = (
                 self._extract_tool_calls_streaming(
                     previous_text=state.previous_text,
@@ -712,6 +721,13 @@ class DelegatingParser(Parser):
                     function_name_returned=state.function_name_returned,
                 )
             )
+
+            if reasoning_from_this_batch:
+                if delta_message is None:
+                    delta_message = DeltaMessage(reasoning=reasoning_from_this_batch)
+                elif not delta_message.reasoning:
+                    delta_message.reasoning = reasoning_from_this_batch
+
             if (
                 delta_message
                 and delta_message.tool_calls
