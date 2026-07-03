@@ -1529,6 +1529,27 @@ class Scheduler(SchedulerInterface):
             if (
                 scheduled_spec_token_ids
                 and generated_token_ids
+                and request.jd_discard_pending == 0
+            ):
+                # Draft tokens accepted past the end-of-reasoning delimiter
+                # were sampled with the grammar bitmask suppressed and may
+                # violate the constraint. Truncate before the rejection
+                # accounting below so the tail is re-labelled as rejected
+                # drafts and re-decoded under the active mask.
+                keep = self.structured_output_manager.reasoning_boundary_keep_len(
+                    request, generated_token_ids
+                )
+                if keep < len(generated_token_ids):
+                    logger.info(
+                        "Truncating %d draft token(s) committed past the "
+                        "end-of-reasoning delimiter for request %s",
+                        len(generated_token_ids) - keep,
+                        req_id,
+                    )
+                    generated_token_ids = generated_token_ids[:keep]
+            if (
+                scheduled_spec_token_ids
+                and generated_token_ids
                 # Skip for a step discarded at jump-forward emission: its
                 # accounting (placeholders, num_computed over the dead
                 # draft positions) was already settled there.

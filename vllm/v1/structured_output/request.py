@@ -23,6 +23,10 @@ class StructuredOutputRequest:
     params: StructuredOutputsParams
     _grammar: Future[StructuredOutputGrammar] | StructuredOutputGrammar | None = None
     reasoning_ended: bool | None = None
+    # How far into all_token_ids the reasoning-end scan has progressed.
+    # Tracked here so the scan covers every committed token exactly once,
+    # independent of async-scheduling / spec-decode accounting.
+    reasoning_scan_len: int = 0
     reasoning_parser_kwargs: dict[str, Any] | None = None
     # Cached per request; do not share reasoning parsers across requests because
     # their behavior can depend on reasoning_parser_kwargs.

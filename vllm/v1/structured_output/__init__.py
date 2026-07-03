@@ -133,6 +133,32 @@ class StructuredOutputManager:
             return new_token_ids
         return [tid for tid in new_token_ids if tid not in control_token_ids]
 
+    def reasoning_boundary_keep_len(
+        self, request: "Request", token_ids: list[int]
+    ) -> int:
+        """Prefix length of a token bundle that is safe to commit.
+
+        A speculative bundle can run past the end-of-reasoning delimiter.
+        The tokens after it were sampled while the grammar bitmask was
+        suppressed (reasoning phase) and may violate the constraint, so
+        they must not be committed. The caller truncates to this length
+        before the draft-rejection accounting, re-labelling the tail as
+        rejected drafts; the positions are then re-decoded under the
+        active mask. Returns len(token_ids) when no cut is needed.
+        """
+        if not request.use_structured_output or self.enable_in_reasoning:
+            return len(token_ids)
+        structured_req = request.structured_output_request
+        if structured_req is None or structured_req.reasoning_ended:
+            return len(token_ids)
+        reasoner = self._get_reasoner(request)
+        if reasoner is None or reasoner.reasoning_end_token_id is None:
+            return len(token_ids)
+        try:
+            return token_ids.index(reasoner.reasoning_end_token_id) + 1
+        except ValueError:
+            return len(token_ids)
+
     def grammar_init(self, request: "Request") -> None:
         if request.structured_output_request is None:
             return
@@ -409,15 +435,21 @@ class StructuredOutputManager:
         if structured_req.reasoning_ended:
             return True
 
-        # Check if reasoning ends in *this* step
-        delta_from = request.num_computed_tokens - request.num_output_placeholders
+        # Check if reasoning ends in the output tokens committed since the
+        # last scan. The offset lives on the request so every committed token
+        # is scanned exactly once, regardless of call site or of async
+        # scheduling / spec decode accounting. (The previous window,
+        # num_computed_tokens - num_output_placeholders, degenerates to the
+        # single last committed token under async scheduling and misses a
+        # delimiter committed mid-bundle by spec decode.)
         all_token_ids = request.all_token_ids
-        start = (
-            delta_from if delta_from >= 0 else max(len(all_token_ids) + delta_from, 0)
-        )
-        if reasoner.is_reasoning_end_streaming(
-            all_token_ids, itertools.islice(all_token_ids, start, None)
-        ):
+        start = max(structured_req.reasoning_scan_len, request.num_prompt_tokens)
+        window = list(itertools.islice(all_token_ids, start, None))
+        structured_req.reasoning_scan_len = len(all_token_ids)
+        if not window:
+            # Nothing new since the last scan (repeat call within a step).
+            return False
+        if reasoner.is_reasoning_end_streaming(all_token_ids, window):
             # Reasoning just ended, so we shouldn't advance til
             # next pass
             structured_req.reasoning_ended = True
