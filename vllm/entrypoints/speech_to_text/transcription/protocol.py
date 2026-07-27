@@ -95,11 +95,11 @@ class TranscriptionRequest(OpenAIBaseModel):
     """
 
     include_token_logprobs: bool = False
-    """Return a per-token logprob for each segment, aligned 1:1 with `tokens`.
+    """Return a per-token logprob, aligned 1:1 with `tokens`.
 
-    Only honoured with response_format="verbose_json", which already computes
-    logprobs. Off by default: the payload grows by roughly one float per
-    token.
+    For response_format="verbose_json" this is reported per segment; for
+    "text"/"json" it is reported once for the whole transcription. Off by
+    default: the payload grows by roughly one float per token.
     """
 
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
@@ -348,6 +348,25 @@ class TranscriptionResponse(OpenAIBaseModel):
     text: str
     """The transcribed text."""
     usage: TranscriptionUsageAudio
+
+    tokens: list[int] | None = None
+    """Array of token IDs for the transcribed text.
+
+    None unless requested via `include_token_logprobs` or `top_logprobs`.
+    """
+
+    token_logprobs: list[float] | None = None
+    """Logprob of each token in `tokens`, same order and same length.
+
+    None when not requested via `include_token_logprobs`.
+    """
+
+    top_logprobs: list[dict[str, float]] | None = None
+    """For each token in `tokens`, a mapping from alternative token text to
+    its logprob, with up to `top_logprobs` entries.
+
+    None when not requested via the request's `top_logprobs` field.
+    """
 
 
 class TranscriptionWord(OpenAIBaseModel):

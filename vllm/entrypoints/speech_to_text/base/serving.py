@@ -5,7 +5,7 @@ import io
 import math
 import time
 import zlib
-from collections.abc import AsyncGenerator, Callable, Set
+from collections.abc import AsyncGenerator, Callable, Sequence, Set
 from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property
 from typing import Final, Literal, TypeAlias, TypeVar, cast
@@ -122,14 +122,16 @@ class SpeechToTextBaseServing(GenerateBaseServing):
 
         self.max_audio_filesize_mb = envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB
         self.max_audio_decode_duration_s: int = envs.VLLM_MAX_AUDIO_DECODE_DURATION_S
-        if self.model_cls.supports_segment_timestamp:
-            self.tokenizer = cast(
-                PreTrainedTokenizerBase,
-                get_tokenizer(
-                    tokenizer_name=self.model_config.tokenizer,
-                    tokenizer_mode=self.model_config.tokenizer_mode,
-                ),
-            )
+        # Needed for verbose_json segmenting, explicit language detection, and
+        # as a decode fallback for logprobs -- load it for every ASR model,
+        # not just ones with `supports_segment_timestamp`.
+        self.tokenizer = cast(
+            PreTrainedTokenizerBase,
+            get_tokenizer(
+                tokenizer_name=self.model_config.tokenizer,
+                tokenizer_mode=self.model_config.tokenizer_mode,
+            ),
+        )
 
         if self.default_sampling_params:
             logger.info(
@@ -345,6 +347,63 @@ class SpeechToTextBaseServing(GenerateBaseServing):
 
         return input_len
 
+    @staticmethod
+    def _token_logprob_and_alternatives(
+        token: int,
+        position_logprobs: dict[int, Logprob],
+        *,
+        num_top_logprobs: int,
+        decode_fallback: Callable[[int], str],
+    ) -> tuple[float, dict[str, float] | None]:
+        """Look up the logprob of `token` at one generated position, plus its
+        top-`num_top_logprobs` alternatives (if requested), keyed by decoded
+        token text.
+
+        `decode_fallback` is only used when the engine didn't already attach
+        a `decoded_token` to a candidate (e.g. skip_tokenizer_init).
+        """
+        entry = position_logprobs.get(token)
+        logprob = entry.logprob if entry is not None else float("nan")
+
+        top_logprobs: dict[str, float] | None = None
+        if num_top_logprobs:
+            top_logprobs = {
+                (alt.decoded_token or decode_fallback(alt_token)): alt.logprob
+                for alt_token, alt in position_logprobs.items()
+            }
+        return logprob, top_logprobs
+
+    def _extract_flat_token_logprobs(
+        self,
+        token_ids: Sequence[int],
+        log_probs: FlatLogprobs | list[dict[int, Logprob]],
+        *,
+        include_token_logprobs: bool,
+        num_top_logprobs: int,
+    ) -> tuple[list[float] | None, list[dict[str, float]] | None]:
+        """Same as `_token_logprob_and_alternatives`, but over a whole
+        (non-segmented) token sequence. Used for the plain text/json response
+        formats, which don't go through `_get_verbose_segments`.
+        """
+        if not include_token_logprobs and not num_top_logprobs:
+            return None, None
+
+        token_logprobs: list[float] | None = [] if include_token_logprobs else None
+        top_logprobs: list[dict[str, float]] | None = [] if num_top_logprobs else None
+
+        for i, token in enumerate(token_ids):
+            logprob, top = self._token_logprob_and_alternatives(
+                token,
+                log_probs[i],
+                num_top_logprobs=num_top_logprobs,
+                decode_fallback=lambda t: self.tokenizer.decode([t]),
+            )
+            if token_logprobs is not None:
+                token_logprobs.append(logprob)
+            if top_logprobs is not None and top is not None:
+                top_logprobs.append(top)
+        return token_logprobs, top_logprobs
+
     def _get_verbose_segments(
         self,
         tokens: tuple,
@@ -434,22 +493,17 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                 segment_logprobs = []
                 segment_top_logprobs = []
             else:
-                position_logprobs = log_probs[idx - 1]
-                entry = position_logprobs.get(token)
-                logprob = entry.logprob if entry is not None else float("nan")
+                logprob, top_logprob = self._token_logprob_and_alternatives(
+                    token,
+                    log_probs[idx - 1],
+                    num_top_logprobs=num_top_logprobs,
+                    decode_fallback=lambda t: self.tokenizer.decode([t]),
+                )
                 avg_logprob += logprob
                 if include_token_logprobs:
                     segment_logprobs.append(logprob)
-                if num_top_logprobs:
-                    segment_top_logprobs.append(
-                        {
-                            (
-                                alt_logprob.decoded_token
-                                or self.tokenizer.decode([alt_token])
-                            ): alt_logprob.logprob
-                            for alt_token, alt_logprob in position_logprobs.items()
-                        }
-                    )
+                if top_logprob is not None:
+                    segment_top_logprobs.append(top_logprob)
         return segments
 
     async def _create_speech_to_text(
@@ -543,8 +597,9 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                 self.default_sampling_params,
             )
 
+        num_top_logprobs = request.top_logprobs or 0
         if request.response_format == "verbose_json" or request.include_token_logprobs:
-            sampling_params.logprobs = max(1, request.top_logprobs or 0)
+            sampling_params.logprobs = max(1, num_top_logprobs)
 
         engine_request_ids = [
             request_id if len(engine_inputs) == 1 else f"{request_id}-{idx}"
@@ -616,6 +671,14 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                 [] for _ in list_result_generator
             ]
             chunk_text_parts: list[list[str]] = [[] for _ in list_result_generator]
+            want_flat_logprobs = request.include_token_logprobs or num_top_logprobs
+            chunk_token_parts: list[list[int]] = [[] for _ in list_result_generator]
+            chunk_token_logprob_parts: list[list[float]] = [
+                [] for _ in list_result_generator
+            ]
+            chunk_top_logprob_parts: list[list[dict[str, float]]] = [
+                [] for _ in list_result_generator
+            ]
             segments_types: dict[str, type[SpeechToTextSegment]] = {
                 "transcribe": TranscriptionSegment,
                 "translate": TranslationSegment,
@@ -648,6 +711,22 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                     chunk_text_parts[idx].append(
                         self.model_cls.post_process_output(raw_text)
                     )
+                    if want_flat_logprobs:
+                        assert op.outputs[0].logprobs
+                        token_ids = list(op.outputs[0].token_ids)
+                        token_logprobs, top_logprobs = (
+                            self._extract_flat_token_logprobs(
+                                token_ids,
+                                op.outputs[0].logprobs,
+                                include_token_logprobs=request.include_token_logprobs,
+                                num_top_logprobs=num_top_logprobs,
+                            )
+                        )
+                        chunk_token_parts[idx].extend(token_ids)
+                        if token_logprobs is not None:
+                            chunk_token_logprob_parts[idx].extend(token_logprobs)
+                        if top_logprobs is not None:
+                            chunk_top_logprob_parts[idx].extend(top_logprobs)
             total_segments = [
                 segment
                 for segment_parts in chunk_segment_parts
@@ -655,6 +734,17 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             ]
             text_parts = [text for text_part in chunk_text_parts for text in text_part]
             text = separator.join(text_parts)
+            flat_tokens = flat_token_logprobs = flat_top_logprobs = None
+            if want_flat_logprobs and request.response_format != "verbose_json":
+                flat_tokens = [t for part in chunk_token_parts for t in part]
+                if request.include_token_logprobs:
+                    flat_token_logprobs = [
+                        lp for part in chunk_token_logprob_parts for lp in part
+                    ]
+                if num_top_logprobs:
+                    flat_top_logprobs = [
+                        lp for part in chunk_top_logprob_parts for lp in part
+                    ]
             if self.task_type == "transcribe":
                 final_response: ResponseType
                 # add usage in TranscriptionResponse.
@@ -665,7 +755,14 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                 }
                 if request.response_format != "verbose_json":
                     final_response = cast(
-                        T, TranscriptionResponse(text=text, usage=usage)
+                        T,
+                        TranscriptionResponse(
+                            text=text,
+                            usage=usage,
+                            tokens=flat_tokens,
+                            token_logprobs=flat_token_logprobs,
+                            top_logprobs=flat_top_logprobs,
+                        ),
                     )
                 else:
                     final_response = cast(
@@ -680,7 +777,15 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             else:
                 # no usage in response for translation task
                 if request.response_format != "verbose_json":
-                    final_response = cast(T, TranslationResponse(text=text))
+                    final_response = cast(
+                        T,
+                        TranslationResponse(
+                            text=text,
+                            tokens=flat_tokens,
+                            token_logprobs=flat_token_logprobs,
+                            top_logprobs=flat_top_logprobs,
+                        ),
+                    )
                 else:
                     final_response = cast(
                         V,
