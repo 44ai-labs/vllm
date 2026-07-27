@@ -375,7 +375,11 @@ class SpeechToTextBaseServing(GenerateBaseServing):
 
         if tokens_with_start[-2] < init_token and tokens_with_start[-1] >= init_token:
             tokens_with_start = tokens_with_start + (tokens_with_start[-1],)
+        include_token_logprobs = request.include_token_logprobs
+        num_top_logprobs = request.top_logprobs or 0
         avg_logprob = 0.0
+        segment_logprobs: list[float] = []
+        segment_top_logprobs: list[dict[str, float]] = []
         for idx in range(1, len(tokens_with_start)):
             # Timestamp tokens (e.g., <|0.00|>) are assumed to be sorted.
             # If the ordering is violated, this slicing may produce incorrect results.
@@ -386,6 +390,22 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                 end_timestamp = sliced_timestamp_tokens[-1] - init_token
                 text = self.tokenizer.decode(sliced_timestamp_tokens[1:-1])
                 text_bytes = text.encode("utf-8")
+                text_token_count = len(sliced_timestamp_tokens[1:-1])
+
+                token_logprobs = (
+                    segment_logprobs[:text_token_count]
+                    if include_token_logprobs
+                    else None
+                )
+                assert token_logprobs is None or (
+                    len(token_logprobs) == text_token_count
+                )
+                top_logprobs = (
+                    segment_top_logprobs[:text_token_count]
+                    if num_top_logprobs
+                    else None
+                )
+                assert top_logprobs is None or (len(top_logprobs) == text_token_count)
 
                 casting_segment = cast(
                     SpeechToTextSegment,
@@ -404,13 +424,32 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                         / len(zlib.compress(text_bytes)),
                         tokens=sliced_timestamp_tokens[1:-1],
                         avg_logprob=avg_logprob / (idx - last_timestamp_start),
+                        token_logprobs=token_logprobs,
+                        top_logprobs=top_logprobs,
                     ),
                 )
                 segments.append(casting_segment)
                 last_timestamp_start = idx
                 avg_logprob = 0
+                segment_logprobs = []
+                segment_top_logprobs = []
             else:
-                avg_logprob += log_probs[idx - 1][token].logprob
+                position_logprobs = log_probs[idx - 1]
+                entry = position_logprobs.get(token)
+                logprob = entry.logprob if entry is not None else float("nan")
+                avg_logprob += logprob
+                if include_token_logprobs:
+                    segment_logprobs.append(logprob)
+                if num_top_logprobs:
+                    segment_top_logprobs.append(
+                        {
+                            (
+                                alt_logprob.decoded_token
+                                or self.tokenizer.decode([alt_token])
+                            ): alt_logprob.logprob
+                            for alt_token, alt_logprob in position_logprobs.items()
+                        }
+                    )
         return segments
 
     async def _create_speech_to_text(
@@ -504,8 +543,8 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                 self.default_sampling_params,
             )
 
-        if request.response_format == "verbose_json":
-            sampling_params.logprobs = 1
+        if request.response_format == "verbose_json" or request.include_token_logprobs:
+            sampling_params.logprobs = max(1, request.top_logprobs or 0)
 
         engine_request_ids = [
             request_id if len(engine_inputs) == 1 else f"{request_id}-{idx}"

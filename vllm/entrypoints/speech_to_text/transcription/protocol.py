@@ -94,6 +94,20 @@ class TranscriptionRequest(OpenAIBaseModel):
     `verbose_json`, or `vtt`.
     """
 
+    include_token_logprobs: bool = False
+    """Return a per-token logprob for each segment, aligned 1:1 with `tokens`.
+
+    Only honoured with response_format="verbose_json", which already computes
+    logprobs. Off by default: the payload grows by roughly one float per
+    token.
+    """
+
+    top_logprobs: int | None = Field(default=None, ge=0, le=20)
+    """Number of most likely alternative tokens to return, with their log
+    probabilities, at each position in `tokens`. Requires
+    `include_token_logprobs=True`. Must be between 0 and 20.
+    """
+
     ## TODO (varun) : Support if set to 0, certain thresholds are met !!
 
     timestamp_granularities: list[Literal["word", "segment"]] = Field(
@@ -291,6 +305,12 @@ class TranscriptionRequest(OpenAIBaseModel):
                 detail="Expected 'file' to be a file-like object, not 'str'.",
             )
 
+        if data.get("top_logprobs") and not data.get("include_token_logprobs"):
+            raise VLLMValidationError(
+                "`top_logprobs` requires `include_token_logprobs=True`.",
+                parameter="top_logprobs",
+            )
+
         stream_opts = ["stream_include_usage", "stream_continuous_usage_stats"]
         stream = data.get("stream", False)
         if any(bool(data.get(so, False)) for so in stream_opts) and not stream:
@@ -381,6 +401,19 @@ class TranscriptionSegment(OpenAIBaseModel):
 
     tokens: list[int]
     """Array of token IDs for the text content."""
+
+    token_logprobs: list[float] | None = None
+    """Logprob of each token in `tokens`, same order and same length.
+
+    None when not requested. Present only for response_format="verbose_json".
+    """
+
+    top_logprobs: list[dict[str, float]] | None = None
+    """For each token in `tokens`, a mapping from alternative token text to
+    its logprob, with up to `top_logprobs` entries.
+
+    None when not requested via the request's `top_logprobs` field.
+    """
 
 
 class TranscriptionResponseVerbose(OpenAIBaseModel):

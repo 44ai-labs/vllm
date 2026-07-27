@@ -79,6 +79,20 @@ class TranslationRequest(OpenAIBaseModel):
     `verbose_json`, or `vtt`.
     """
 
+    include_token_logprobs: bool = False
+    """Return a per-token logprob for each segment, aligned 1:1 with `tokens`.
+
+    Only honoured with response_format="verbose_json", which already computes
+    logprobs. Off by default: the payload grows by roughly one float per
+    token.
+    """
+
+    top_logprobs: int | None = Field(default=None, ge=0, le=20)
+    """Number of most likely alternative tokens to return, with their log
+    probabilities, at each position in `tokens`. Requires
+    `include_token_logprobs=True`. Must be between 0 and 20.
+    """
+
     # --8<-- [start:translation-sampling-params]
     use_beam_search: bool = False
     """Whether or not beam search should be used."""
@@ -284,6 +298,12 @@ class TranslationRequest(OpenAIBaseModel):
                 parameter=invalid_param,
             )
 
+        if data.get("top_logprobs") and not data.get("include_token_logprobs"):
+            raise VLLMValidationError(
+                "`top_logprobs` requires `include_token_logprobs=True`.",
+                parameter="top_logprobs",
+            )
+
         xargs = data.get("vllm_xargs")
         if isinstance(xargs, str):
             try:
@@ -354,6 +374,19 @@ class TranslationSegment(OpenAIBaseModel):
 
     tokens: list[int]
     """Array of token IDs for the text content."""
+
+    token_logprobs: list[float] | None = None
+    """Logprob of each token in `tokens`, same order and same length.
+
+    None when not requested. Present only for response_format="verbose_json".
+    """
+
+    top_logprobs: list[dict[str, float]] | None = None
+    """For each token in `tokens`, a mapping from alternative token text to
+    its logprob, with up to `top_logprobs` entries.
+
+    None when not requested via the request's `top_logprobs` field.
+    """
 
 
 class TranslationResponseVerbose(OpenAIBaseModel):
