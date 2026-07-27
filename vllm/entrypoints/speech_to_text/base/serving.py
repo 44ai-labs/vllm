@@ -41,6 +41,7 @@ from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import get_tokenizer
 from vllm.utils.async_utils import make_async_with_semaphore, merge_async_iterators
 
+from ..base.protocol import TopLogprob
 from ..transcription.protocol import (
     TranscriptionResponse,
     TranscriptionResponseStreamChoice,
@@ -354,10 +355,17 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         *,
         num_top_logprobs: int,
         decode_fallback: Callable[[int], str],
-    ) -> tuple[float, dict[str, float] | None]:
+    ) -> tuple[float, list[TopLogprob] | None]:
         """Look up the logprob of `token` at one generated position, plus its
-        top-`num_top_logprobs` alternatives (if requested), keyed by decoded
-        token text.
+        top-`num_top_logprobs` alternatives (if requested).
+
+        Alternatives are returned as a list carrying each candidate's id, not
+        as a mapping keyed by decoded text: distinct ids can decode to the same
+        string, and a text-keyed mapping drops all but one of them. See
+        `TopLogprob` for why that is routine rather than a corner case.
+
+        Sorted by descending logprob, so index 0 is the argmax and callers can
+        take a runner-up without re-sorting.
 
         `decode_fallback` is only used when the engine didn't already attach
         a `decoded_token` to a candidate (e.g. skip_tokenizer_init).
@@ -365,12 +373,20 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         entry = position_logprobs.get(token)
         logprob = entry.logprob if entry is not None else float("nan")
 
-        top_logprobs: dict[str, float] | None = None
+        top_logprobs: list[TopLogprob] | None = None
         if num_top_logprobs:
-            top_logprobs = {
-                (alt.decoded_token or decode_fallback(alt_token)): alt.logprob
-                for alt_token, alt in position_logprobs.items()
-            }
+            top_logprobs = sorted(
+                (
+                    TopLogprob(
+                        id=alt_token,
+                        token=alt.decoded_token or decode_fallback(alt_token),
+                        logprob=alt.logprob,
+                    )
+                    for alt_token, alt in position_logprobs.items()
+                ),
+                key=lambda candidate: candidate.logprob,
+                reverse=True,
+            )
         return logprob, top_logprobs
 
     def _extract_flat_token_logprobs(
@@ -380,7 +396,7 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         *,
         include_token_logprobs: bool,
         num_top_logprobs: int,
-    ) -> tuple[list[float] | None, list[dict[str, float]] | None]:
+    ) -> tuple[list[float] | None, list[list[TopLogprob]] | None]:
         """Same as `_token_logprob_and_alternatives`, but over a whole
         (non-segmented) token sequence. Used for the plain text/json response
         formats, which don't go through `_get_verbose_segments`.
@@ -389,7 +405,7 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             return None, None
 
         token_logprobs: list[float] | None = [] if include_token_logprobs else None
-        top_logprobs: list[dict[str, float]] | None = [] if num_top_logprobs else None
+        top_logprobs: list[list[TopLogprob]] | None = [] if num_top_logprobs else None
 
         for i, token in enumerate(token_ids):
             logprob, top = self._token_logprob_and_alternatives(
@@ -438,7 +454,7 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         num_top_logprobs = request.top_logprobs or 0
         avg_logprob = 0.0
         segment_logprobs: list[float] = []
-        segment_top_logprobs: list[dict[str, float]] = []
+        segment_top_logprobs: list[list[TopLogprob]] = []
         for idx in range(1, len(tokens_with_start)):
             # Timestamp tokens (e.g., <|0.00|>) are assumed to be sorted.
             # If the ordering is violated, this slicing may produce incorrect results.
@@ -676,7 +692,7 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             chunk_token_logprob_parts: list[list[float]] = [
                 [] for _ in list_result_generator
             ]
-            chunk_top_logprob_parts: list[list[dict[str, float]]] = [
+            chunk_top_logprob_parts: list[list[list[TopLogprob]]] = [
                 [] for _ in list_result_generator
             ]
             segments_types: dict[str, type[SpeechToTextSegment]] = {

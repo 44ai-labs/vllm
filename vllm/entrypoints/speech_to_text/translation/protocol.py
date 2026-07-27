@@ -26,7 +26,7 @@ from vllm.sampling_params import (
 )
 from vllm.utils import random_uuid
 
-from ..base.protocol import _LONG_INFO, AudioResponseFormat
+from ..base.protocol import _LONG_INFO, AudioResponseFormat, TopLogprob
 
 if TYPE_CHECKING:
     import numpy as np
@@ -334,9 +334,12 @@ class TranslationResponse(OpenAIBaseModel):
     None when not requested via `include_token_logprobs`.
     """
 
-    top_logprobs: list[dict[str, float]] | None = None
-    """For each token in `tokens`, a mapping from alternative token text to
-    its logprob, with up to `top_logprobs` entries.
+    top_logprobs: list[list[TopLogprob]] | None = None
+    """For each token in `tokens`, its most likely candidates, best first.
+
+    Up to `top_logprobs` entries per position. A list rather than a
+    text-keyed mapping because distinct token ids can decode to the same
+    string — see `TopLogprob`.
 
     None when not requested via the request's `top_logprobs` field.
     """
@@ -400,9 +403,12 @@ class TranslationSegment(OpenAIBaseModel):
     None when not requested. Present only for response_format="verbose_json".
     """
 
-    top_logprobs: list[dict[str, float]] | None = None
-    """For each token in `tokens`, a mapping from alternative token text to
-    its logprob, with up to `top_logprobs` entries.
+    top_logprobs: list[list[TopLogprob]] | None = None
+    """For each token in `tokens`, its most likely candidates, best first.
+
+    Up to `top_logprobs` entries per position. A list rather than a
+    text-keyed mapping because distinct token ids can decode to the same
+    string — see `TopLogprob`.
 
     None when not requested via the request's `top_logprobs` field.
     """

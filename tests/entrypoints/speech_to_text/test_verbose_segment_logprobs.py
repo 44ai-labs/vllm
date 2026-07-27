@@ -100,7 +100,7 @@ def test_token_logprobs_aligned_with_tokens():
     assert all(s.top_logprobs is None for s in real_segments)
 
 
-def test_top_logprobs_include_alternatives_keyed_by_decoded_token():
+def test_top_logprobs_include_alternatives_with_ids():
     request = TranscriptionRequest(
         file=_upload_file(), include_token_logprobs=True, top_logprobs=2
     )
@@ -109,9 +109,14 @@ def test_top_logprobs_include_alternatives_keyed_by_decoded_token():
     real_segments = [s for s in segments if s.tokens]
     seg_ab, seg_c = real_segments
 
-    # One dict of alternatives per token, same length as `tokens`.
+    # One candidate list per token, same length as `tokens`, best first.
     assert len(seg_ab.top_logprobs) == len(seg_ab.tokens) == 2
-    assert seg_ab.top_logprobs == [{"a": -0.2, "b": -1.5}, {"b": -0.3, "a": -2.0}]
+    assert [[(c.token, c.logprob) for c in pos] for pos in seg_ab.top_logprobs] == [
+        [("a", -0.2), ("b", -1.5)],
+        [("b", -0.3), ("a", -2.0)],
+    ]
 
     assert len(seg_c.top_logprobs) == len(seg_c.tokens) == 1
-    assert seg_c.top_logprobs == [{"c": -0.4, "d": -3.0}]
+    assert [[(c.token, c.logprob) for c in pos] for pos in seg_c.top_logprobs] == [
+        [("c", -0.4), ("d", -3.0)]
+    ]
