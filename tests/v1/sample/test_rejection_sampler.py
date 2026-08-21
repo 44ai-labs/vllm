@@ -878,10 +878,12 @@ def test_allowed_token_ids(rejection_sampler):
 def _logitsprocs_with(processor_cls, batch_size: int, sampling_params: list):
     """Build a LogitsProcessors holding one builtin processor primed with
     per-request sampling params (request index == list index)."""
-    from vllm.config import SchedulerConfig, VllmConfig
+    from types import SimpleNamespace
+
     from vllm.v1.sample.logits_processor.interface import BatchUpdate
 
-    vllm_config = VllmConfig(scheduler_config=SchedulerConfig(max_num_seqs=16))
+    # The builtin processors only read scheduler_config.max_num_seqs.
+    vllm_config = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=16))
     proc = processor_cls(vllm_config, torch.device(DEVICE_TYPE), False)
     added = [(i, sp, None, []) for i, sp in enumerate(sampling_params)]
     proc.update_state(
