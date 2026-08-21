@@ -102,16 +102,29 @@ class MinPLogitsProcessor(LogitsProcessor):
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self.min_p_count:
             return logits
+        return self._apply_min_p(logits, self.min_p)
 
-        # Convert logits to probability distribution
+    def apply_with_spec_decode(
+        self,
+        logits: torch.Tensor,
+        num_draft_tokens: list[int],
+    ) -> torch.Tensor:
+        """Spec-decode version of apply(): expand the per-request min_p to the
+        per-draft-position target rows (request ``i`` owns ``num_draft_tokens[i]``
+        consecutive rows)."""
+        if not self.min_p_count:
+            return logits
+        num_reqs = len(num_draft_tokens)
+        repeats = torch.tensor(num_draft_tokens, device=self.min_p.device)
+        min_p_rows = self.min_p[:num_reqs].repeat_interleave(repeats, dim=0)
+        return self._apply_min_p(logits, min_p_rows)
+
+    @staticmethod
+    def _apply_min_p(logits: torch.Tensor, min_p: torch.Tensor) -> torch.Tensor:
         probability_values = torch.nn.functional.softmax(logits, dim=-1)
-        # Calculate maximum probabilities per sequence
         max_probabilities = torch.amax(probability_values, dim=-1, keepdim=True)
-        # Adjust min_p
-        adjusted_min_p = max_probabilities.mul_(self.min_p)
-        # Identify valid tokens using threshold comparison
+        adjusted_min_p = max_probabilities.mul_(min_p)
         invalid_token_mask = probability_values < adjusted_min_p
-        # Apply mask using boolean indexing
         logits.masked_fill_(invalid_token_mask, -float("inf"))
         return logits
 
@@ -159,6 +172,42 @@ class LogitBiasLogitsProcessor(LogitsProcessor):
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if self.biases:
             logits[self.logits_slice] += self.bias_tensor
+        return logits
+
+    def apply_with_spec_decode(
+        self,
+        logits: torch.Tensor,
+        num_draft_tokens: list[int],
+    ) -> torch.Tensor:
+        """Spec-decode version of apply(): ``logits`` holds the target rows of
+        every draft position, request ``i`` owning ``num_draft_tokens[i]``
+        consecutive rows, so each request's sparse bias fans out over its rows.
+        """
+        if not self.biases:
+            return logits
+        num_draft_arr = np.asarray(num_draft_tokens, dtype=np.int64)
+        cumsum = np.concatenate([[0], np.cumsum(num_draft_arr)])
+        rows: list[np.ndarray] = []
+        toks: list[np.ndarray] = []
+        vals: list[np.ndarray] = []
+        for req_idx, lb in self.biases.items():
+            n_rows = int(num_draft_arr[req_idx]) if req_idx < len(num_draft_arr) else 0
+            if n_rows == 0:
+                continue
+            row_indices = np.arange(cumsum[req_idx], cumsum[req_idx] + n_rows)
+            rows.append(np.repeat(row_indices, len(lb)))
+            toks.append(np.tile(np.fromiter(lb.keys(), dtype=np.int64), n_rows))
+            vals.append(np.tile(np.fromiter(lb.values(), dtype=np.float32), n_rows))
+        if not rows:
+            return logits
+        logits.index_put_(
+            (
+                self._device_tensor(np.concatenate(rows).tolist(), torch.int64),
+                self._device_tensor(np.concatenate(toks).tolist(), torch.int64),
+            ),
+            self._device_tensor(np.concatenate(vals).tolist(), torch.float32),
+            accumulate=True,
+        )
         return logits
 
 
