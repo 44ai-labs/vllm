@@ -5847,7 +5847,7 @@ def _setup_jump_forward_request(scheduler, request, opt_in: bool = True):
 
 
 def _make_mock_grammar(ff_tokens: list[int]):
-    grammar = Mock()
+    grammar = Mock(spec=StructuredOutputGrammar)
     grammar.accept_tokens = Mock(return_value=True)
     grammar.is_terminated = Mock(return_value=False)
     grammar.advance_ff_tokens = Mock(return_value=ff_tokens)
@@ -5858,6 +5858,7 @@ def _make_structured_output_request(grammar):
     sor = Mock()
     sor.grammar = grammar
     sor.reasoning_ended = None
+    sor.reasoning_end_token_index = None
     return sor
 
 
@@ -6085,11 +6086,13 @@ def test_jump_decoding_rejected_when_server_jd_disabled():
     )
     with pytest.raises(ValueError, match="enable_jump_decoding"):
         sp._validate_structured_outputs(
-            structured_outputs_config=so_config_off, tokenizer=None
+            model_config=None, structured_outputs_config=so_config_off, tokenizer=None
         )
     # Case 2: server has no structured_outputs config at all.
     with pytest.raises(ValueError, match="enable_jump_decoding"):
-        sp._validate_structured_outputs(structured_outputs_config=None, tokenizer=None)
+        sp._validate_structured_outputs(
+            model_config=None, structured_outputs_config=None, tokenizer=None
+        )
 
 
 def test_jump_forward_skipped_when_request_opts_out():
@@ -6207,7 +6210,7 @@ def test_jd_prefill_match_invariant():
 def _make_prefill_grammar(span: list[int], is_prefill: bool = True):
     """Mock grammar at a [prefill] decision whose decision-independent forced span
     is ``span`` (what compute_prefill_ff_tokens returns)."""
-    grammar = Mock()
+    grammar = Mock(spec=StructuredOutputGrammar)
     grammar.is_terminated = Mock(return_value=False)
     grammar.is_prefill_region = Mock(return_value=is_prefill)
     grammar.compute_prefill_ff_tokens = Mock(return_value=span)
