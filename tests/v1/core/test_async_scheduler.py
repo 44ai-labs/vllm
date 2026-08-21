@@ -75,7 +75,9 @@ def test_async_per_request_spec_decode_opt_out():
     opted-out requests so the next ``schedule()`` reserves no speculative slots for
     them, while opted-in requests keep their placeholders.
     """
-    scheduler = create_scheduler(async_scheduling=True, num_speculative_tokens=3)
+    scheduler = create_scheduler(
+        async_scheduling=True, num_speculative_tokens=3, speculative_method="ngram_gpu"
+    )
 
     # Separate create_requests calls so each request owns its SamplingParams.
     opted_in = create_requests(num_requests=1, max_tokens=10, req_ids=["in"])[0]
@@ -774,11 +776,13 @@ def test_async_jump_forward_discards_inflight_sample():
 
     req = create_requests(num_requests=1, max_tokens=20)[0]
     req.sampling_params.structured_outputs = Mock(enable_jump_decoding=True)
-    grammar = Mock()
+    grammar = Mock(spec=StructuredOutputGrammar)
     grammar.accept_tokens = Mock(return_value=True)
     grammar.is_terminated = Mock(return_value=False)
     grammar.advance_ff_tokens = Mock(return_value=[100, 101, 102])
-    req.structured_output_request = Mock(grammar=grammar, reasoning_ended=None)
+    req.structured_output_request = Mock(
+        grammar=grammar, reasoning_ended=None, reasoning_end_token_index=None
+    )
     scheduler.add_request(req)
 
     # Step N (prefill + first sample) and step N+1 are scheduled before
@@ -822,11 +826,13 @@ def test_async_jump_forward_no_inflight_no_discard():
 
     req = create_requests(num_requests=1, max_tokens=20)[0]
     req.sampling_params.structured_outputs = Mock(enable_jump_decoding=True)
-    grammar = Mock()
+    grammar = Mock(spec=StructuredOutputGrammar)
     grammar.accept_tokens = Mock(return_value=True)
     grammar.is_terminated = Mock(return_value=False)
     grammar.advance_ff_tokens = Mock(return_value=[100])
-    req.structured_output_request = Mock(grammar=grammar, reasoning_ended=None)
+    req.structured_output_request = Mock(
+        grammar=grammar, reasoning_ended=None, reasoning_end_token_index=None
+    )
     scheduler.add_request(req)
 
     # Only step N scheduled: its own placeholder is consumed by the commit,
@@ -851,11 +857,13 @@ def test_async_jump_forward_discard_rolls_back_dead_spec_positions():
 
     req = create_requests(num_requests=1, max_tokens=20)[0]
     req.sampling_params.structured_outputs = Mock(enable_jump_decoding=True)
-    grammar = Mock()
+    grammar = Mock(spec=StructuredOutputGrammar)
     grammar.accept_tokens = Mock(return_value=True)
     grammar.is_terminated = Mock(return_value=False)
     grammar.advance_ff_tokens = Mock(return_value=[100, 101, 102])
-    req.structured_output_request = Mock(grammar=grammar, reasoning_ended=None)
+    req.structured_output_request = Mock(
+        grammar=grammar, reasoning_ended=None, reasoning_end_token_index=None
+    )
     scheduler.add_request(req)
 
     sched_n = scheduler.schedule()
@@ -889,7 +897,11 @@ def test_async_jd_discard_skips_spec_rejection_accounting():
 
     req = create_requests(num_requests=1, max_tokens=20)[0]
     req.sampling_params.structured_outputs = Mock(enable_jump_decoding=True)
-    req.structured_output_request = Mock(grammar=Mock(), reasoning_ended=None)
+    req.structured_output_request = Mock(
+        grammar=Mock(spec=StructuredOutputGrammar),
+        reasoning_ended=None,
+        reasoning_end_token_index=None,
+    )
     scheduler.add_request(req)
     scheduler.schedule()
 
