@@ -133,6 +133,39 @@ class StructuredOutputManager:
             return new_token_ids
         return [tid for tid in new_token_ids if tid not in control_token_ids]
 
+    def reasoning_boundary_keep_len(
+        self, request: "Request", token_ids: list[int]
+    ) -> int:
+        """Prefix length of a token bundle that is safe to commit.
+
+        A speculative bundle can run past the end-of-reasoning delimiter.
+        The tokens after it were sampled while the grammar bitmask was
+        suppressed (reasoning phase) and may violate the constraint, so
+        they must not be committed. The caller truncates to this length
+        before the draft-rejection accounting, re-labelling the tail as
+        rejected drafts; the positions are then re-decoded under the
+        active mask. Returns len(token_ids) when no cut is needed.
+
+        The mid-window detection in grammar_bitmask covers only delimiters
+        that appear among the *current* window's drafts; under async
+        scheduling the delimiter can commit in a step whose output is
+        processed after the next step's bitmask was built from stale
+        token state, so the boundary must also be enforced here at commit
+        time.
+        """
+        if not request.use_structured_output or self.enable_in_reasoning:
+            return len(token_ids)
+        structured_req = request.structured_output_request
+        if structured_req is None or structured_req.reasoning_ended:
+            return len(token_ids)
+        reasoner = self._get_reasoner(request)
+        if reasoner is None or reasoner.reasoning_end_token_id is None:
+            return len(token_ids)
+        try:
+            return token_ids.index(reasoner.reasoning_end_token_id) + 1
+        except ValueError:
+            return len(token_ids)
+
     def grammar_init(self, request: "Request") -> None:
         if request.structured_output_request is None:
             return
