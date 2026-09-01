@@ -42,6 +42,7 @@ class CompletionOutput:
     token_ids: GenericSequence[int]
     cumulative_logprob: float | None
     logprobs: SampleLogprobs | None
+    token_texts: list[str] | None = None
     routed_experts: np.ndarray | None = None  # [seq_len,layer_num,topk]
     finish_reason: str | None = None
     stop_reason: int | str | None = None
@@ -165,6 +166,13 @@ class RequestOutput:
                         if not isinstance(completion.token_ids, MutableSequence):
                             completion.token_ids = list(completion.token_ids)
                         completion.token_ids.extend(next_completion.token_ids)
+                        # token_texts must stay 1:1 with token_ids across a
+                        # coalesced span; keeping only one side desyncs
+                        # consumers that pair them with the logprobs delta.
+                        if next_completion.token_texts is not None:
+                            if completion.token_texts is None:
+                                completion.token_texts = []
+                            completion.token_texts.extend(next_completion.token_texts)
                         if next_completion.logprobs:
                             assert completion.logprobs is not None
                             completion.logprobs.extend(next_completion.logprobs)  # type: ignore[arg-type]

@@ -253,6 +253,8 @@ if TYPE_CHECKING:
     VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS: bool = False
     VLLM_SYSTEM_START_DATE: str | None = None
     VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY: bool = False
+    VLLM_JD_DEBUG_ASSERTS: bool = False
+    JD_GUARANTEED_PREFILL: bool = False
     VLLM_CUSTOM_SCOPES_FOR_PROFILING: bool = False
     VLLM_NVTX_SCOPES_FOR_PROFILING: bool = False
     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES: bool = True
@@ -1833,6 +1835,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY": lambda: bool(
         int(os.getenv("VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY", "0"))
     ),
+    # Cheap runtime assertions on jump-decoding / speculative-decode invariants
+    # (e.g. ff tokens and spec drafts never scheduled for one request in one
+    # step). Off by default; for debugging/CI.
+    "VLLM_JD_DEBUG_ASSERTS": lambda: bool(int(os.getenv("VLLM_JD_DEBUG_ASSERTS", "0"))),
+    # jd_guaranteed_prefill: when a request opted into jump decoding is at a
+    # grammar `[prefill]` decision (a decision-independent forced span follows),
+    # pre-schedule the chunk [D, S_pred] for the in-flight step instead of taking
+    # the async discard-and-redo, then verify S_pred against the actual post-decision
+    # ff span and fall back to the discard on mismatch. Off by default so we can A/B
+    # the discard vs the guaranteed-prefill path.
+    "JD_GUARANTEED_PREFILL": lambda: bool(int(os.getenv("JD_GUARANTEED_PREFILL", "0"))),
     # Add optional custom scopes for profiling, disable to avoid overheads
     "VLLM_CUSTOM_SCOPES_FOR_PROFILING": lambda: bool(
         int(os.getenv("VLLM_CUSTOM_SCOPES_FOR_PROFILING", "0"))

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -267,6 +267,18 @@ class SchedulerOutput:
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
+
+    # Jump-forward decoding: grammar-forced tokens to write to the buffer.
+    # req_id -> list of deterministic token IDs
+    jump_forward_tokens: dict[str, list[int]] = field(default_factory=dict)
+
+    # jd_guaranteed_prefill: the decision-independent forced span S_pred to
+    # pre-write after the in-flight decision token D, laying this step out as the
+    # chunk [D, S_pred] (see JD_GUARANTEED_PREFILL). req_id -> S_pred token IDs.
+    # Distinct from jump_forward_tokens: that span is anchored at the committed
+    # tail (D already in the buffer); this one is anchored at pos_D + 1, with D
+    # arriving via the async sampled-token scatter in the same step.
+    guaranteed_prefill_tokens: dict[str, list[int]] = field(default_factory=dict)
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

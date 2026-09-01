@@ -45,6 +45,25 @@ class StructuredOutputGrammar(ABC):
             bool: True if the tokens are accepted, False otherwise.
         """
 
+    def accept_draft_tokens(self, request_id: str, tokens: list[int]) -> int:
+        """
+        Advances the FSM over speculative draft tokens, stopping at the
+        first token the grammar rejects. Drafts are unverified proposals,
+        so a rejection is expected behavior, not an error.
+
+        The default delegates to ``accept_tokens`` (which may record an
+        error state on rejection); backends with a non-erroring consume
+        should override.
+
+        Args:
+            request_id (str): The unique identifier for the request.
+            tokens (list[int]): Draft token IDs to advance over.
+
+        Returns:
+            int: The number of leading tokens the grammar accepted.
+        """
+        return len(tokens) if self.accept_tokens(request_id, tokens) else 0
+
     @abstractmethod
     def validate_tokens(self, tokens: list[int]) -> list[int]:
         """
@@ -87,6 +106,41 @@ class StructuredOutputGrammar(ABC):
         Returns:
             bool: True if the process is terminated, False otherwise.
         """
+
+    def advance_ff_tokens(self) -> list[int]:
+        """Computes fast-forward (deterministic) tokens from the grammar.
+
+        Returns tokens that the grammar forces without needing model
+        inference. Default implementation returns empty list.
+        """
+        return []
+
+    def is_prefill_region(self) -> bool:
+        """Whether the next token is a pre-schedulable decision (a ``[prefill]``
+        grammar annotation) after which a decision-independent forced span follows.
+        Used by jd_guaranteed_prefill to pre-schedule that span. Backends without the
+        annotation return False (feature inert). Default returns False.
+        """
+        return False
+
+    def compute_prefill_ff_tokens(self) -> list[int]:
+        """The decision-independent forced span after a ``[prefill]`` decision,
+        discovered on a throwaway grammar copy without advancing the committed
+        grammar. Default implementation returns empty list (feature inert).
+        """
+        return []
+
+    def clone_for_speculation(self) -> "StructuredOutputGrammar | None":
+        """Return an independent copy of this grammar for speculative
+        advancement, or None if the backend cannot cheaply clone.
+
+        The copy is meant to be advanced through tentative
+        (speculative-decode draft) tokens and then discarded, so that the
+        committed grammar state is never mutated and no (potentially
+        non-inverting) rollback is required. Backends that return None
+        fall back to the accept-then-rollback walk.
+        """
+        return None
 
     @abstractmethod
     def reset(self):

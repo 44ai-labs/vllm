@@ -169,6 +169,21 @@ class Request:
         # deferred block freeing (see Scheduler._free_request_blocks).
         self.last_sched_seq = 0
 
+        # Async scheduling + jump-forward decoding: number of in-flight steps
+        # whose sample must be discarded. Set when ff tokens are emitted while
+        # a step is in flight — that step's forward predates the jump, so its
+        # sample is conditioned on a pre-jump context while being masked (and
+        # ordered) post-jump. The async scheduler drops the step's output and
+        # the position is re-decoded after the ff tokens are processed.
+        self.jd_discard_pending = 0
+
+        # jd_guaranteed_prefill: the decision-independent forced span S_pred that
+        # the in-flight step was pre-scheduled to prefill ([D, S_pred]). Set at
+        # the predicting schedule(), read at the next update_from_output to verify
+        # S_pred == S_actual; on match the discard/redo is skipped. None when no
+        # guaranteed prefill is in flight.
+        self.pending_prefill_pred: list[int] | None = None
+
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt

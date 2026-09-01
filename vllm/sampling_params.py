@@ -81,6 +81,11 @@ class StructuredOutputsParams:
     disable_additional_properties: bool = False
     whitespace_pattern: str | None = None
     structural_tag: str | None = None
+    enable_jump_decoding: bool | None = None
+    """Per-request opt-in for jump-forward decoding. Requires the server
+    to also enable it via StructuredOutputsConfig.enable_jump_decoding.
+    None/False = no FF tokens for this request; True = use FF when the
+    grammar forces deterministic tokens."""
 
     _backend: str | None = field(default=None, init=False)
     """CAUTION: Should only be set by Processor._validate_structured_output"""
@@ -304,6 +309,16 @@ class SamplingParams(
     `RequestOutput`. Raises the interval above the engine-level
     `--stream-interval`. Values below engine setting are clamped up to it.
     The first and final outputs are always emitted immediately."""
+    return_token_texts: bool = False
+    """Whether to return per-token detokenized strings alongside generated
+    text.  When True the detokenizer accumulates the individual
+    ``decode_next()`` results so they can be surfaced in the response."""
+    enable_speculative_decoding: bool | None = None
+    """Per-request opt-in for speculative decoding. Requires the server
+    to also have a SpeculativeConfig (e.g. ``--speculative-config '{...}'``).
+    None/False = drafts produced by the proposer are discarded for this
+    request (it runs as if speculative decoding were off); True = drafts
+    are used."""
     skip_clone: bool = False
     """Internal flag indicating that this SamplingParams instance is safe to
     reuse without cloning. When True, clone() will return self without
@@ -383,6 +398,8 @@ class SamplingParams(
         spaces_between_special_tokens: bool = True,
         output_kind: RequestOutputKind = RequestOutputKind.CUMULATIVE,
         stream_interval: int | None = None,
+        return_token_texts: bool = False,
+        enable_speculative_decoding: bool | None = None,
         structured_outputs: StructuredOutputsParams | None = None,
         logit_bias: dict[int, float] | dict[str, float] | None = None,
         allowed_token_ids: list[int] | None = None,
@@ -446,6 +463,8 @@ class SamplingParams(
             spaces_between_special_tokens=spaces_between_special_tokens,
             output_kind=output_kind,
             stream_interval=stream_interval,
+            return_token_texts=return_token_texts,
+            enable_speculative_decoding=enable_speculative_decoding,
             structured_outputs=structured_outputs,
             logit_bias=logit_bias,
             allowed_token_ids=allowed_token_ids,
@@ -888,14 +907,16 @@ class SamplingParams(
         self,
         speculative_config: SpeculativeConfig | None,
     ) -> None:
-        if speculative_config is None:
-            return
-
-        # Some sampling parameters are not yet compatible with spec decoding.
-        if self.min_p > _SAMPLING_EPS or self.logit_bias:
-            raise VLLMValidationError(
-                "The min_p and logit_bias sampling parameters "
-                "are not yet supported with speculative decoding."
+        # Reject per-request MTP opt-in against a server that has no
+        # SpeculativeConfig (no --speculative-config flag). Without it the
+        # proposer model is not loaded and the per-request flag would be a
+        # silent no-op, masking deployment-config bugs as performance issues.
+        if self.enable_speculative_decoding and speculative_config is None:
+            raise ValueError(
+                "enable_speculative_decoding=True was set on this request, "
+                "but the server has no SpeculativeConfig (start with "
+                '--speculative-config \'{"method":"...",...}\'). The flag '
+                "would otherwise be silently ignored."
             )
 
     def _validate_diffusion(self, model_config: ModelConfig) -> None:
@@ -926,6 +947,27 @@ class SamplingParams(
         structured_outputs_config: StructuredOutputsConfig | None,
         tokenizer: TokenizerLike | None,
     ) -> None:
+        # Per-request JD opt-in requires the server to also have
+        # enable_jump_decoding=true in --structured-outputs-config.
+        # llguidance only maintains the ff-token state when the server has
+        # opted in at startup; without it, advance_ff_tokens() returns []
+        # and the per-request flag would be silently no-op. Raise loudly so
+        # deployment-config mistakes surface as 4xx, not as missing speedups.
+        if (
+            self.structured_outputs is not None
+            and self.structured_outputs.enable_jump_decoding
+            and (
+                structured_outputs_config is None
+                or not structured_outputs_config.enable_jump_decoding
+            )
+        ):
+            raise ValueError(
+                "structured_outputs.enable_jump_decoding=True was set on this "
+                "request, but the server was not started with "
+                "--structured-outputs-config '{...,\"enable_jump_decoding\":true}'. "
+                "The flag would otherwise be silently ignored."
+            )
+
         if structured_outputs_config is None or self.structured_outputs is None:
             return
 

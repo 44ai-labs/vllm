@@ -875,6 +875,105 @@ def test_allowed_token_ids(rejection_sampler):
     assert torch.equal(output.sampled_token_ids, expected)
 
 
+def _logitsprocs_with(processor_cls, batch_size: int, sampling_params: list):
+    """Build a LogitsProcessors holding one builtin processor primed with
+    per-request sampling params (request index == list index)."""
+    from types import SimpleNamespace
+
+    from vllm.v1.sample.logits_processor.interface import BatchUpdate
+
+    # The builtin processors only read scheduler_config.max_num_seqs.
+    vllm_config = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=16))
+    proc = processor_cls(vllm_config, torch.device(DEVICE_TYPE), False)
+    added = [(i, sp, None, []) for i, sp in enumerate(sampling_params)]
+    proc.update_state(
+        BatchUpdate(batch_size=batch_size, removed=[], moved=[], added=added)
+    )
+    return LogitsProcessors([proc])
+
+
+def test_logit_bias(rejection_sampler):
+    """logit_bias must apply to every draft-verification row of a request.
+
+    Request 0 biases token 2 far down, so its second draft (2) is rejected and
+    the fallback token 15 is sampled; request 1 has no bias and keeps all
+    drafts; request 2 biases token 15 up so it wins over the drafted 12.
+    """
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.sample.logits_processor.builtin import LogitBiasLogitsProcessor
+
+    spec_tokens = [[1, 2, 3], [1, 15, 3], [7, 10, 12]]
+    output_tokens = [[1, 2, 3, 4], [1, 15, 3, 4], [7, 10, 12, 5]]
+    logits = create_logits_tensor(output_tokens, token_idx_to_override=15)
+    metadata = create_sampling_metadata(
+        all_greedy=True,
+        output_token_ids=[[], [], []],
+        spec_token_ids=spec_tokens,
+    )
+    metadata.logitsprocs = _logitsprocs_with(
+        LogitBiasLogitsProcessor,
+        batch_size=3,
+        sampling_params=[
+            SamplingParams(logit_bias={2: -1000.0}),
+            SamplingParams(),
+            SamplingParams(logit_bias={15: 10.0}),
+        ],
+    )
+    bonus_token_tensor = torch.tensor(
+        [output_tokens[i][-1] for i in range(len(output_tokens))], device=logits.device
+    )
+    spec_decode_metadata = create_spec_decode_metadata(spec_tokens, logits)
+    mock_sampler_output(rejection_sampler, bonus_token_tensor)
+    output = rejection_sampler(
+        spec_decode_metadata,
+        draft_probs=None,
+        logits=logits,
+        sampling_metadata=metadata,
+    )
+    expected = torch.tensor(
+        [[1, 15, -1, -1], [1, 15, 3, 4], [15, -1, -1, -1]],
+        dtype=torch.int,
+        device=logits.device,
+    )
+    assert torch.equal(output.sampled_token_ids, expected)
+
+
+def test_min_p_with_spec_decode(rejection_sampler):
+    """min_p must be applied per draft row: with min_p=0.5 the near-tie
+    alternative (token 15 at logit 99 vs 100) is masked out, so the random
+    verification can never pick it; without min_p it stays eligible."""
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.sample.logits_processor.builtin import MinPLogitsProcessor
+
+    spec_tokens = [[1, 2, 3]]
+    output_tokens = [[1, 2, 3, 4]]
+    logits = create_logits_tensor(output_tokens, token_idx_to_override=15)
+    # Make 1 and 15 an exact tie so min_p decides whether 15 survives.
+    logits[:, 15] = 100.0
+    metadata = create_sampling_metadata(
+        all_greedy=True,
+        output_token_ids=[[]],
+        spec_token_ids=spec_tokens,
+    )
+    metadata.logitsprocs = _logitsprocs_with(
+        MinPLogitsProcessor, batch_size=1, sampling_params=[SamplingParams(min_p=0.5)]
+    )
+    processed = rejection_sampler.apply_logits_processors(
+        logits.clone(), metadata, create_spec_decode_metadata(spec_tokens, logits)
+    )
+    # Both tie tokens have p == p_max, so both survive; everything else is -inf.
+    assert torch.isinf(processed[0, 0]) and processed[0, 0] < 0
+    assert not torch.isinf(processed[0, 1]) and not torch.isinf(processed[0, 15])
+    # Break the tie: 15 slightly below max -> masked at min_p=0.5 only if its
+    # probability drops under half of the max.
+    logits[:, 15] = 98.0
+    processed = rejection_sampler.apply_logits_processors(
+        logits.clone(), metadata, create_spec_decode_metadata(spec_tokens, logits)
+    )
+    assert torch.isinf(processed[:, 15]).all()
+    assert not torch.isinf(processed[0, 1])
+
+
 @pytest.mark.parametrize("batch_size", [1, 100])
 @pytest.mark.parametrize("vocab_size", [100, 8192, 10000])
 @pytest.mark.parametrize("max_spec_len", [1, 3])
