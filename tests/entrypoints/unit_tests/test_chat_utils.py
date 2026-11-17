@@ -18,6 +18,7 @@ from vllm.entrypoints.chat_utils import (
     MEDIA_CONNECTOR_REGISTRY,
     AsyncMultiModalItemTracker,
     ConversationMessage,
+    _decoded_tool_result,
     _postprocess_messages,
     parse_chat_messages,
     parse_chat_messages_async,
@@ -2770,6 +2771,147 @@ def test_postprocess_messages_null_arguments_string():
     tool_calls = messages[0]["tool_calls"]
     assert tool_calls is not None
     assert tool_calls[0]["function"]["arguments"] == {}
+
+
+def _tool_exchange(*results: str | list[dict[str, str]]) -> list[ConversationMessage]:
+    """One assistant message calling ``Tool0``, ``Tool1``, ... and their results."""
+    return [
+        {"role": "user", "content": "go"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": f"call_{index}",
+                    "type": "function",
+                    "function": {"name": f"Tool{index}", "arguments": "{}"},
+                }
+                for index in range(len(results))
+            ],
+        },
+        *(
+            {"role": "tool", "tool_call_id": f"call_{index}", "content": content}
+            for index, content in enumerate(results)
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ('{"scope": "a \\"b\\"\\n\\nc"}', {"scope": 'a "b"\n\nc'}),
+        ('[{"id": "tpl-1"}, "x"]', [{"id": "tpl-1"}, "x"]),
+        ('"# Guide\\n\\nLine two"', "# Guide\n\nLine two"),
+        ("Tool call failed: boom", "Tool call failed: boom"),
+        (
+            'total_items=2 shown=2\n{"items": []}',
+            'total_items=2 shown=2\n{"items": []}',
+        ),
+        ("3", "3"),
+        ("true", "true"),
+        ("null", "null"),
+        ("", ""),
+    ],
+)
+def test_decoded_tool_result(content: str, expected):
+    assert _decoded_tool_result(content) == expected
+
+
+def test_postprocess_messages_leaves_tool_results_alone_by_default(monkeypatch):
+    monkeypatch.delenv("VLLM_DECODE_TOOL_RESULTS", raising=False)
+    messages = _tool_exchange('{"scope": "a\\nb"}')
+
+    _postprocess_messages(messages)
+
+    assert "tool_responses" not in messages[1]
+    assert messages[2]["content"] == '{"scope": "a\\nb"}'
+
+
+def test_postprocess_messages_attaches_decoded_tool_results(monkeypatch):
+    monkeypatch.setenv("VLLM_DECODE_TOOL_RESULTS", "1")
+    state = '{"scope": {"description": "Mark \\"Vorbefund\\".\\n\\nOtherwise none."}}'
+    messages = _tool_exchange(state, "Tool call failed: boom")
+
+    _postprocess_messages(messages)
+
+    assert messages[1]["tool_responses"] == [
+        {
+            "name": "Tool0",
+            "response": {
+                "scope": {"description": 'Mark "Vorbefund".\n\nOtherwise none.'}
+            },
+        },
+        {"name": "Tool1", "response": "Tool call failed: boom"},
+    ]
+    # The tool messages stay as sent, for templates that read them.
+    assert [message["content"] for message in messages[2:]] == [
+        state,
+        "Tool call failed: boom",
+    ]
+    assert messages[1]["tool_calls"][0]["function"]["arguments"] == {}
+
+
+def test_postprocess_messages_names_tool_results_by_call_id(monkeypatch):
+    monkeypatch.setenv("VLLM_DECODE_TOOL_RESULTS", "1")
+    messages = _tool_exchange("{}", "{}", "{}")
+    # Answered out of order; one result has an unknown id but a name, one has neither.
+    messages[2]["tool_call_id"] = "call_2"
+    messages[3]["tool_call_id"] = "call_other"
+    messages[3]["name"] = "Named"
+    messages[4]["tool_call_id"] = None
+
+    _postprocess_messages(messages)
+
+    assert [response["name"] for response in messages[1]["tool_responses"]] == [
+        "Tool2",
+        "Named",
+        "unknown",
+    ]
+
+
+def test_postprocess_messages_attaches_results_to_their_own_call(monkeypatch):
+    monkeypatch.setenv("VLLM_DECODE_TOOL_RESULTS", "1")
+    first = _tool_exchange('{"round": 1}')
+    second = _tool_exchange('{"round": 2}')[1:]
+    messages = [*first, {"role": "assistant", "content": "Read it."}, *second]
+
+    _postprocess_messages(messages)
+
+    assert messages[1]["tool_responses"][0]["response"] == {"round": 1}
+    assert "tool_responses" not in messages[3]
+    assert messages[4]["tool_responses"][0]["response"] == {"round": 2}
+
+
+def test_postprocess_messages_keeps_structured_tool_results_on_their_path(
+    monkeypatch,
+):
+    monkeypatch.setenv("VLLM_DECODE_TOOL_RESULTS", "1")
+    messages = _tool_exchange("{}", [{"type": "tool_reference", "name": "x"}])
+
+    _postprocess_messages(messages)
+
+    assert "tool_responses" not in messages[1]
+
+
+def test_postprocess_messages_keeps_tool_responses_already_set(monkeypatch):
+    monkeypatch.setenv("VLLM_DECODE_TOOL_RESULTS", "1")
+    messages = _tool_exchange('{"new": true}')
+    messages[1]["tool_responses"] = [{"name": "Tool0", "response": {"old": True}}]
+
+    _postprocess_messages(messages)
+
+    assert messages[1]["tool_responses"] == [
+        {"name": "Tool0", "response": {"old": True}}
+    ]
+
+
+def test_postprocess_messages_ignores_a_call_without_results(monkeypatch):
+    monkeypatch.setenv("VLLM_DECODE_TOOL_RESULTS", "1")
+    messages = _tool_exchange("{}")[:2]
+
+    _postprocess_messages(messages)
+
+    assert "tool_responses" not in messages[1]
 
 
 @pytest.mark.asyncio
