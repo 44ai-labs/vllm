@@ -401,6 +401,10 @@ class ConversationMessage(TypedDict, total=False):
     task: str | None
     """Model-specific task marker. Currently passed through for DeepSeek V4."""
 
+    tool_responses: list[dict[str, Any]] | None
+    """The results of this message's tool calls, decoded; set when
+    ``VLLM_DECODE_TOOL_RESULTS`` is on."""
+
 
 # Passed in by user
 ChatTemplateContentFormatOption = Literal["auto", "string", "openai"]
