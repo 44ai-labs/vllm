@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import json
 import warnings
 from collections.abc import Mapping
 from typing import Literal
@@ -2815,6 +2816,15 @@ def _tool_exchange(*results: str | list[dict[str, str]]) -> list[ConversationMes
 )
 def test_decoded_tool_result(content: str, expected):
     assert _decoded_tool_result(content) == expected
+
+
+@pytest.mark.parametrize("depth", [101, 20_000])
+def test_decoded_tool_result_keeps_deep_nesting_as_text(depth: int):
+    at_limit = "[" * 100 + "]" * 100
+    assert _decoded_tool_result(at_limit) == json.loads(at_limit)
+
+    too_deep = '{"a": ' * (depth - 1) + "[]" + "}" * (depth - 1)
+    assert _decoded_tool_result(too_deep) == too_deep
 
 
 def test_postprocess_messages_leaves_tool_results_alone_by_default(monkeypatch):

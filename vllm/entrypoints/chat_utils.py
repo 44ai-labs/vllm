@@ -1908,13 +1908,38 @@ def _parse_chat_message_content(
     return result
 
 
+# Chat templates render a decoded result with a recursive macro: the Gemma 4
+# template runs out of stack just under 200 levels, a string renders at any depth.
+_MAX_DECODED_TOOL_RESULT_DEPTH = 100
+
+
+def _nests_deeper_than(value: dict | list, limit: int) -> bool:
+    containers: list[dict | list] = [value]
+    for _ in range(limit):
+        containers = [
+            child
+            for parent in containers
+            for child in (parent.values() if isinstance(parent, dict) else parent)
+            if isinstance(child, (dict, list))
+        ]
+        if not containers:
+            return False
+    return True
+
+
 def _decoded_tool_result(content: str) -> Any:
     """A JSON object, array or string as the value it encodes; other content as is."""
     try:
         value = json.loads(content)
-    except ValueError:
+    except (ValueError, RecursionError):
         return content
-    return value if isinstance(value, (dict, list, str)) else content
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, (dict, list)):
+        return content
+    if _nests_deeper_than(value, _MAX_DECODED_TOOL_RESULT_DEPTH):
+        return content
+    return value
 
 
 def _attach_tool_responses(messages: list[ConversationMessage]) -> None:
