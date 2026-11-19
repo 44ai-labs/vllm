@@ -255,6 +255,7 @@ if TYPE_CHECKING:
     VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY: bool = False
     VLLM_JD_DEBUG_ASSERTS: bool = False
     JD_GUARANTEED_PREFILL: bool = False
+    VLLM_DECODE_TOOL_RESULTS: bool = False
     VLLM_CUSTOM_SCOPES_FOR_PROFILING: bool = False
     VLLM_NVTX_SCOPES_FOR_PROFILING: bool = False
     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES: bool = True
@@ -1846,6 +1847,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ff span and fall back to the discard on mismatch. Off by default so we can A/B
     # the discard vs the guaranteed-prefill path.
     "JD_GUARANTEED_PREFILL": lambda: bool(int(os.getenv("JD_GUARANTEED_PREFILL", "0"))),
+    # Attach decoded tool results to the calling assistant message as
+    # `tool_responses`, so templates that render structured values natively
+    # (Gemma 4) show them without JSON escapes, like tool-call arguments.
+    "VLLM_DECODE_TOOL_RESULTS": lambda: bool(
+        int(os.getenv("VLLM_DECODE_TOOL_RESULTS", "0"))
+    ),
     # Add optional custom scopes for profiling, disable to avoid overheads
     "VLLM_CUSTOM_SCOPES_FOR_PROFILING": lambda: bool(
         int(os.getenv("VLLM_CUSTOM_SCOPES_FOR_PROFILING", "0"))

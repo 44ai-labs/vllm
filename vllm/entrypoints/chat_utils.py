@@ -9,7 +9,7 @@ from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from functools import cached_property, lru_cache, partial
-from itertools import accumulate
+from itertools import accumulate, takewhile
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -400,6 +400,10 @@ class ConversationMessage(TypedDict, total=False):
 
     task: str | None
     """Model-specific task marker. Currently passed through for DeepSeek V4."""
+
+    tool_responses: list[dict[str, Any]] | None
+    """The results of this message's tool calls, decoded; set when
+    ``VLLM_DECODE_TOOL_RESULTS`` is on."""
 
 
 # Passed in by user
@@ -1908,6 +1912,75 @@ def _parse_chat_message_content(
     return result
 
 
+# Chat templates render a decoded result with a recursive macro: the Gemma 4
+# template runs out of stack just under 200 levels, a string renders at any depth.
+_MAX_DECODED_TOOL_RESULT_DEPTH = 100
+
+
+def _nests_deeper_than(value: dict | list, limit: int) -> bool:
+    containers: list[dict | list] = [value]
+    for _ in range(limit):
+        containers = [
+            child
+            for parent in containers
+            for child in (parent.values() if isinstance(parent, dict) else parent)
+            if isinstance(child, (dict, list))
+        ]
+        if not containers:
+            return False
+    return True
+
+
+def _decoded_tool_result(content: str) -> Any:
+    """A JSON object, array or string as the value it encodes; other content as is."""
+    try:
+        value = json.loads(content)
+    except (ValueError, RecursionError):
+        return content
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, (dict, list)):
+        return content
+    if _nests_deeper_than(value, _MAX_DECODED_TOOL_RESULT_DEPTH):
+        return content
+    return value
+
+
+def _attach_tool_responses(messages: list[ConversationMessage]) -> None:
+    """Attach the tool results that follow each call, decoded, as ``tool_responses``.
+
+    A JSON result sent as text reaches the prompt with its escapes and the model
+    copies them. Templates that render structured values natively (Gemma 4) show
+    a decoded result without them, like the tool-call arguments. The
+    ``role: tool`` messages stay for templates that read them.
+    """
+    for index, message in enumerate(messages):
+        if message["role"] != "assistant" or not message.get("tool_calls"):
+            continue
+        results = list(
+            takewhile(lambda follow: follow["role"] == "tool", messages[index + 1 :])
+        )
+        # A result with an image or other non-text part stays on the template's
+        # own path, which places the media tokens.
+        if not results or not all(isinstance(r.get("content"), str) for r in results):
+            continue
+        names = {
+            call.get("id"): call["function"]["name"] for call in message["tool_calls"]
+        }
+        # The Gemma 4 template cannot render a dict as a tool message's content.
+        # `tool_responses` is its native field: when present, the template renders
+        # it and skips the `role: tool` messages that follow.
+        message["tool_responses"] = [
+            {
+                "name": names.get(result.get("tool_call_id"))
+                or result.get("name")
+                or "unknown",
+                "response": _decoded_tool_result(result["content"]),
+            }
+            for result in results
+        ]
+
+
 def _postprocess_messages(messages: list[ConversationMessage]) -> None:
     # per the Transformers docs & maintainers, tool call arguments in
     # assistant-role messages with tool_calls need to be dicts not JSON str -
@@ -1949,6 +2022,9 @@ def _postprocess_messages(messages: list[ConversationMessage]) -> None:
                         function["arguments"] = parsed if parsed is not None else {}
                 else:
                     function["arguments"] = {}
+
+    if envs.VLLM_DECODE_TOOL_RESULTS:
+        _attach_tool_responses(messages)
 
 
 def parse_chat_messages(
