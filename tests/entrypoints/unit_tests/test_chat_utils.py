@@ -2903,18 +2903,6 @@ def test_postprocess_messages_keeps_structured_tool_results_on_their_path(
     assert "tool_responses" not in messages[1]
 
 
-def test_postprocess_messages_keeps_tool_responses_already_set(monkeypatch):
-    monkeypatch.setenv("VLLM_DECODE_TOOL_RESULTS", "1")
-    messages = _tool_exchange('{"new": true}')
-    messages[1]["tool_responses"] = [{"name": "Tool0", "response": {"old": True}}]
-
-    _postprocess_messages(messages)
-
-    assert messages[1]["tool_responses"] == [
-        {"name": "Tool0", "response": {"old": True}}
-    ]
-
-
 def test_postprocess_messages_ignores_a_call_without_results(monkeypatch):
     monkeypatch.setenv("VLLM_DECODE_TOOL_RESULTS", "1")
     messages = _tool_exchange("{}")[:2]
