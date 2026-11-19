@@ -181,6 +181,26 @@ class CompletionRequest(OpenAIBaseModel):
             "inputs and pre-tokenized inputs always yield null."
         ),
     )
+    return_token_texts: bool | None = Field(
+        default=None,
+        description=(
+            "If specified, the result includes per-token detokenized strings "
+            "(one entry per generated token) from contextual incremental "
+            "detokenization. Like token_ids and logprobs, this is the complete "
+            "raw per-token trace: it covers every generated token (including "
+            "reasoning tokens) and is not filtered into the curated "
+            "text/reasoning views. "
+            "len(token_texts) == len(token_ids) when both are requested."
+        ),
+    )
+    enable_speculative_decoding: bool | None = Field(
+        default=None,
+        description=(
+            "Per-request opt-in for speculative decoding. Requires the "
+            "server to have --speculative-config set. If unset/false, "
+            "proposer-produced drafts are discarded for this request."
+        ),
+    )
 
     cache_salt: str | None = Field(
         default=None,
@@ -376,6 +396,8 @@ class CompletionRequest(OpenAIBaseModel):
             if self.stream
             else RequestOutputKind.FINAL_ONLY,
             stream_interval=self.stream_interval,
+            return_token_texts=bool(self.return_token_texts),
+            enable_speculative_decoding=self.enable_speculative_decoding,
             structured_outputs=self.extract_structured_outputs(),
             logit_bias=self.logit_bias,
             allowed_token_ids=self.allowed_token_ids,
@@ -609,6 +631,7 @@ class CompletionResponseChoice(OpenAIBaseModel):
         ),
     )
     token_ids: list[int] | None = None  # For response
+    token_texts: list[str] | None = None
     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
     prompt_token_ids: list[int] | None = None  # For prompt
     # Per-token expert routing decisions, base64-encoded ``.npy`` bytes
@@ -660,6 +683,7 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
     # prompt tokens is put into choice to align with CompletionResponseChoice
     prompt_token_ids: list[int] | None = None
     token_ids: list[int] | None = None
+    token_texts: list[str] | None = None
 
 
 class CompletionStreamResponse(OpenAIBaseModel):

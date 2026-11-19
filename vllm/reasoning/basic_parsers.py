@@ -47,6 +47,10 @@ class BaseThinkingReasoningParser(ReasoningParser):
     def reasoning_end_str(self) -> str:
         return self.end_token
 
+    @property
+    def reasoning_end_token_id(self) -> int | None:
+        return self.end_token_id
+
     def __init__(self, tokenizer: TokenizerLike, *args, **kwargs):
         super().__init__(tokenizer, *args, **kwargs)
 

@@ -89,6 +89,15 @@ class LogprobsProcessor:
             rank = rank_np.tolist()
             logprobs = logprobs_np.tolist()
             token_ids = token_ids_np.tolist()
+            # Jump-forward rows pad columns 1.. with -1 sentinels (invalid
+            # token ids; see the scheduler's ff-token logprobs). Keep only
+            # the valid prefix -- column 0 is always the real forced token --
+            # so detokenization never sees a negative id (tokenizer.decode
+            # raises OverflowError on it).
+            if token_ids and token_ids[-1] < 0:
+                num_valid = next(i for i, t in enumerate(token_ids) if t < 0)
+                token_ids = token_ids[:num_valid]
+                logprobs = logprobs[:num_valid]
             # Detokenize (non-incrementally).
             decoded_tokens: list[str] | Iterable[None]
             if self.tokenizer is None:

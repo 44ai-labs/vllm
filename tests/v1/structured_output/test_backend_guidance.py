@@ -129,6 +129,103 @@ def test_grammar_bitmask_with_specdec():
         grammar_bitmask(request, prompt[i:] + [tokenizer.eos_token_id])
 
 
+def _fill(grammar, vocab_size: int):
+    import llguidance.torch as llguidance_torch
+
+    bitmask = llguidance_torch.allocate_token_bitmask(1, vocab_size)
+    grammar.fill_bitmask(bitmask, 0)
+    return bitmask
+
+
+def test_clone_for_speculation_isolates_committed_matcher():
+    # A speculative clone must be advanceable through tentative draft
+    # tokens (including a grammar-illegal one) without ever mutating the
+    # committed matcher, so no rollback is needed.
+    import torch
+
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    vocab_size = 50257
+    backend = GuidanceBackend(
+        VllmConfig(
+            structured_outputs_config=StructuredOutputsConfig(backend="guidance")
+        ),
+        tokenizer=tokenizer,
+        vocab_size=vocab_size,
+    )
+    grammar = backend.compile_grammar(StructuredOutputOptions.REGEX, r"[0-9]{6}")
+
+    assert grammar.accept_tokens("", tokenizer.encode("12"))
+    mask_before = _fill(grammar, vocab_size)
+    terminated_before = grammar.is_terminated()
+
+    legal = tokenizer.encode("3")
+    illegal = tokenizer.encode("x")
+    assert grammar.validate_tokens(illegal) == []  # sanity: 'x' is illegal here
+
+    spec = grammar.clone_for_speculation()
+    assert spec.accept_tokens("", legal)  # clone advances on legal draft
+    assert not spec.accept_tokens("", illegal)  # illegal draft truncates (no raise)
+
+    # Committed matcher is byte-for-byte unchanged by the clone walk.
+    assert torch.equal(mask_before, _fill(grammar, vocab_size))
+    assert grammar.is_terminated() == terminated_before
+
+    # A clone advanced by the legal prefix yields the same mask as an
+    # independent matcher advanced the same way: masks are correct, not stale.
+    ref = backend.compile_grammar(StructuredOutputOptions.REGEX, r"[0-9]{6}")
+    assert ref.accept_tokens("", tokenizer.encode("123"))
+    spec2 = grammar.clone_for_speculation()
+    assert spec2.accept_tokens("", legal)
+    assert torch.equal(_fill(spec2, vocab_size), _fill(ref, vocab_size))
+
+
+def test_grammar_bitmask_specdec_illegal_draft_does_not_crash():
+    # A grammar-illegal speculative draft token must truncate the
+    # clone-walk silently and leave the committed grammar untouched.
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    prompt = tokenizer.encode("12")  # legal prefix for r"[0-9]{6}"
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(tokenizer=TOKENIZER),
+        structured_outputs_config=StructuredOutputsConfig(backend="guidance"),
+        speculative_config=SpeculativeConfig(model="[ngram]", num_speculative_tokens=3),
+    )
+    manager = StructuredOutputManager(vllm_config)
+
+    sampling_params = SamplingParams(
+        structured_outputs=StructuredOutputsParams(regex=r"[0-9]{6}"),
+    )
+    sampling_params.structured_outputs._backend = "guidance"
+    sampling_params.update_from_generation_config({}, tokenizer.eos_token_id)
+
+    request = Request(
+        "illegal_draft_req",
+        prompt_token_ids=prompt,
+        sampling_params=sampling_params,
+        pooling_params=None,
+    )
+    manager.grammar_init(request)
+    while not request.structured_output_request._check_grammar_completion():
+        continue
+
+    grammar = request.structured_output_request.grammar
+    assert grammar.accept_tokens(request.request_id, prompt)
+
+    # Draft: one legal digit then a grammar-illegal letter token.
+    drafts = tokenizer.encode("3") + tokenizer.encode("x")
+    assert grammar.validate_tokens(drafts) != drafts  # confirms 'x' is illegal
+
+    # Must not raise, and must not advance or terminate the committed
+    # grammar.
+    manager.grammar_bitmask(
+        requests={request.request_id: request},
+        structured_output_request_ids={request.request_id: 0},
+        scheduled_spec_decode_tokens={request.request_id: drafts},
+    )
+    assert not grammar.is_terminated()
+    # Committed grammar still expects exactly the legal continuation.
+    assert grammar.validate_tokens(tokenizer.encode("4")) == tokenizer.encode("4")
+
+
 @pytest.mark.parametrize("async_grammar", [True, False])
 def test_grammar_init_async_and_sync(async_grammar):
     """Test grammar initialization works correctly in both async and sync modes.

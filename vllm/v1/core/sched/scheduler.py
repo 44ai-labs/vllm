@@ -7,6 +7,9 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import numpy as np
+
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -56,7 +59,12 @@ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutp
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
-from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import (
+    DraftTokenIds,
+    KVConnectorOutput,
+    LogprobsLists,
+    ModelRunnerOutput,
+)
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
@@ -64,6 +72,114 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _request_opts_into_spec_decode(request: Request) -> bool:
+    """Per-request opt-in gate for speculative decoding.
+
+    Server-side SpeculativeConfig is the capability gate; this returns
+    True only when the request explicitly asked for spec drafts via
+    SamplingParams.enable_speculative_decoding. Default (None / False)
+    discards proposer-produced drafts for this request, matching no-spec
+    behavior.
+    """
+    sp = request.sampling_params
+    if sp is None:
+        return False
+    return bool(sp.enable_speculative_decoding)
+
+
+def _request_opts_into_jump_decoding(request: Request) -> bool:
+    """Per-request opt-in gate for jump-forward decoding.
+
+    Server-side StructuredOutputsConfig.enable_jump_decoding is the
+    capability gate; this returns True only when the request explicitly
+    asked for FF via SamplingParams.structured_outputs.enable_jump_decoding.
+    Default (None / False) means no FF tokens for the request.
+    """
+    sp = request.sampling_params
+    if sp is None or sp.structured_outputs is None:
+        return False
+    return bool(sp.structured_outputs.enable_jump_decoding)
+
+
+def _assert_jd_spec_disjoint(
+    jump_forward_tokens: dict[str, list[int]],
+    scheduled_spec_decode_tokens: dict[str, list[int]],
+) -> None:
+    """Assert no request carries both fast-forward tokens and speculative
+    drafts in one step; their buffer writes target the same rows and would
+    collide. Gated by VLLM_JD_DEBUG_ASSERTS (off in production).
+    """
+    for req_id, ff in jump_forward_tokens.items():
+        spec = scheduled_spec_decode_tokens.get(req_id)
+        assert not (ff and spec), (
+            f"jump-forward and spec drafts both scheduled for {req_id}: "
+            f"ff={ff!r}, spec={spec!r}"
+        )
+
+
+def _assert_jd_cache_safe(request: Request, num_to_cache: int) -> None:
+    """Assert the prefix-cache boundary never covers uncommitted-or-uncomputed KV.
+
+    Under async jump decoding a jump appends ff tokens (growing ``num_tokens`` and
+    the request's block hashes) but rolls ``num_computed_tokens`` back over them and
+    over the dead spec slots, and the discarded in-flight step is dropped without
+    caching. Caching must therefore stay at or below the committed token length, so a
+    block whose KV belongs to the discarded/uncomputed span is never hashed into the
+    prefix cache and later reused as a stale prefix. ``num_to_cache`` is the boundary
+    handed to ``cache_blocks`` (``num_computed_tokens - num_output_placeholders``,
+    minus the in-flight ``pending_prefill_pred`` span for a guaranteed-prefill
+    ``[D, S_pred]`` step whose forced S is computed but not yet committed/verified);
+    in steady decode it equals ``num_tokens`` and after a jump it is strictly below.
+    Gated by VLLM_JD_DEBUG_ASSERTS (off in production).
+    """
+    assert 0 <= num_to_cache <= request.num_tokens, (
+        f"prefix-cache boundary {num_to_cache} outside committed range "
+        f"[0, {request.num_tokens}] for request {request.request_id} "
+        f"(num_computed_tokens={request.num_computed_tokens}, "
+        f"num_output_placeholders={request.num_output_placeholders}, "
+        f"jd_discard_pending={request.jd_discard_pending})"
+    )
+
+
+def _assert_jd_discard_depth(request: Request) -> None:
+    """Assert a jump stacks at most one pending discard.
+
+    At batch_queue depth 2 at most one step is in flight per request, so a jump can
+    discard at most one in-flight sample before its output is processed. A value > 1
+    means several in-flight steps were dropped against a single jump -- only possible
+    if pipeline parallelism (queue depth > 2) was enabled without revisiting the
+    discard-redo bookkeeping (the redo assumes the discarded output arrives in one
+    update). Gated by VLLM_JD_DEBUG_ASSERTS (off in production).
+    """
+    assert request.jd_discard_pending <= 1, (
+        f"jd_discard_pending={request.jd_discard_pending} > 1 for request "
+        f"{request.request_id}: the batch_queue depth-2 single-in-flight assumption "
+        f"no longer holds (pipeline parallelism enabled?)."
+    )
+
+
+def _assert_jd_prefill_match(
+    request: Request, s_pred: list[int], s_actual: list[int]
+) -> None:
+    """Assert a jd_guaranteed_prefill prediction matched the actual forced span.
+
+    A ``[prefill]`` annotation asserts the forced span after the decision is
+    decision-independent, so the span S_pred predicted (from one allowed branch) at
+    schedule time must equal the actual span S_actual the committed decision forces.
+    A mismatch means the grammar's ``[prefill]`` rule is in fact decision-dependent
+    (or wrongly annotated): correctness is still safe (the engine falls back to the
+    discard-redo), but it is a wasted pre-schedule and a grammar bug worth catching.
+    Gated by VLLM_JD_DEBUG_ASSERTS (off in production), and only checked when the
+    span was not truncated by a stop.
+    """
+    assert s_pred == s_actual, (
+        f"jd_guaranteed_prefill prediction mismatch for request "
+        f"{request.request_id}: predicted S_pred={s_pred!r} but the committed "
+        f"decision forced S_actual={s_actual!r}; the [prefill] rule is not "
+        f"decision-independent."
+    )
 
 
 class Scheduler(SchedulerInterface):
@@ -104,6 +220,11 @@ class Scheduler(SchedulerInterface):
         )
         # Track requests scheduled in prior step (MRV1-only).
         self.prev_step_scheduled_req_ids: set[str] = set()
+        # Jump-forward decoding: grammar-forced tokens pending write to buffer.
+        self.jump_decoding_enabled = (
+            vllm_config.structured_outputs_config.enable_jump_decoding
+        )
+        self.pending_ff_tokens: dict[str, list[int]] = {}
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -468,6 +589,9 @@ class Scheduler(SchedulerInterface):
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
         # Whether the running batch contains any prefill requests.
         prefill_scheduled = False
+        # jd_guaranteed_prefill: req_id -> S_pred, the decision-independent forced
+        # span pre-scheduled after the in-flight decision token D ([D, S_pred]).
+        guaranteed_prefill_tokens: dict[str, list[int]] = {}
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -513,23 +637,65 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
-            num_new_tokens = (
-                request.num_tokens_with_spec
-                + request.num_output_placeholders
-                - request.num_computed_tokens
-            )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget)
+            # jd_guaranteed_prefill: if this running request opted into jump
+            # decoding, has an in-flight decision token D (num_output_placeholders
+            # > 0), and its committed grammar is at a `[prefill]` decision (a
+            # decision-independent forced span S follows), lay this in-flight step
+            # out as the chunk [D, S_pred] instead of the plain decode that the
+            # async jump path would otherwise discard. D arrives via the async
+            # sampled-token scatter; S_pred is the grammar's predicted span. The
+            # decision is verified at update_from_output (S_pred == S_actual); on a
+            # mismatch the step is discarded and the validated redo runs, so a wrong
+            # prediction costs a wasted prefill, never correctness.
+            guaranteed_prefill_span = self._maybe_guaranteed_prefill_span(request)
 
-            # Make sure the input position does not exceed the max model len.
-            # This is necessary when using spec decoding.
-            num_new_tokens = min(
-                num_new_tokens,
-                self.max_model_len
-                - request.num_computed_tokens
-                - self.num_sampled_tokens_per_step,
-            )
+            if guaranteed_prefill_span is not None:
+                # [D, S_pred]: one decision token + the forced span, no draft verify.
+                # Only commit to this layout if the whole chunk fits the budget and
+                # the model-len bound; otherwise fall back to a normal decode (and
+                # thus the discard-redo), since a truncated span would corrupt S.
+                chunk_len = 1 + len(guaranteed_prefill_span)
+                fits = (
+                    chunk_len <= token_budget
+                    and chunk_len
+                    <= self.max_model_len
+                    - request.num_computed_tokens
+                    - self.num_sampled_tokens_per_step
+                )
+                if fits:
+                    num_new_tokens = chunk_len
+                    # No draft verify on a prefill step; the async _update_after_
+                    # schedule re-sets spec_token_ids for the *next* step's drafts.
+                    request.spec_token_ids = []
+                    request.pending_prefill_pred = guaranteed_prefill_span
+                    guaranteed_prefill_tokens[request.request_id] = (
+                        guaranteed_prefill_span
+                    )
+                else:
+                    guaranteed_prefill_span = None
+
+            if guaranteed_prefill_span is None:
+                num_new_tokens = (
+                    request.num_tokens_with_spec
+                    + request.num_output_placeholders
+                    - request.num_computed_tokens
+                )
+                if (
+                    0
+                    < self.scheduler_config.long_prefill_token_threshold
+                    < num_new_tokens
+                ):
+                    num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+                num_new_tokens = min(num_new_tokens, token_budget)
+
+                # Make sure the input position does not exceed the max model len.
+                # This is necessary when using spec decoding.
+                num_new_tokens = min(
+                    num_new_tokens,
+                    self.max_model_len
+                    - request.num_computed_tokens
+                    - self.num_sampled_tokens_per_step,
+                )
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -1162,6 +1328,19 @@ class Scheduler(SchedulerInterface):
             self.prev_step_scheduled_req_ids.clear()
             self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
+        # Jump-forward: pass pending ff tokens for scheduled requests only.
+        # Retain ff tokens for requests not scheduled in this step.
+        jump_forward_tokens = {
+            req_id: tokens
+            for req_id, tokens in self.pending_ff_tokens.items()
+            if req_id in num_scheduled_tokens
+        }
+        for req_id in jump_forward_tokens:
+            del self.pending_ff_tokens[req_id]
+
+        if envs.VLLM_JD_DEBUG_ASSERTS:
+            _assert_jd_spec_disjoint(jump_forward_tokens, scheduled_spec_decode_tokens)
+
         # Producer partial-tail hand-off for external KV connectors. Drained
         # before the CoW retentions are released below, so the pin lands while
         # the cow block still holds a retention ref. Without a producer-side
@@ -1226,6 +1405,8 @@ class Scheduler(SchedulerInterface):
             partial_tail_offloads=pending_partial_tail_offloads,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
+            jump_forward_tokens=jump_forward_tokens,
+            guaranteed_prefill_tokens=guaranteed_prefill_tokens,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1306,6 +1487,9 @@ class Scheduler(SchedulerInterface):
         )
         request.num_stale_output_tokens = request.num_in_flight_tokens
         request.num_output_placeholders = 0
+        # Preemption drops all in-flight output, so a pending jump-forward
+        # discard must not survive and eat the first post-resume token.
+        request.jd_discard_pending = 0
         request.num_preemptions += 1
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
@@ -1313,6 +1497,39 @@ class Scheduler(SchedulerInterface):
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
         self.reset_preempted_req_ids.add(request.request_id)
+
+    def _maybe_guaranteed_prefill_span(self, request: Request) -> list[int] | None:
+        """jd_guaranteed_prefill predict.
+
+        If `request` opted into jump decoding, has an in-flight decision token D
+        (``num_output_placeholders > 0``), and its committed grammar is at a
+        ``[prefill]`` decision with a non-empty, decision-independent forced span,
+        return that span S_pred so the in-flight step can be laid out as
+        ``[D, S_pred]`` instead of a plain decode that the async jump path would
+        discard. Returns None (no pre-schedule) otherwise. Gated by
+        JD_GUARANTEED_PREFILL; the prediction is always verified against the actual
+        post-decision ff span in update_from_output, so a wrong ``[prefill]``
+        annotation can only waste a prefill, never corrupt output.
+        """
+        if not envs.JD_GUARANTEED_PREFILL:
+            return None
+        # Need an in-flight decision token D to fold into the chunk, and don't
+        # stack a second guaranteed prefill while one is awaiting verification.
+        if request.num_output_placeholders <= 0 or request.pending_prefill_pred:
+            return None
+        if not _request_opts_into_jump_decoding(request):
+            return None
+        if not self.structured_output_manager.should_advance(request):
+            return None
+        sor = request.structured_output_request
+        if sor is None or sor.grammar is None:
+            return None
+        grammar = sor.grammar
+        if grammar.is_terminated() or not grammar.is_prefill_region():
+            return None
+        # Clone-walk in the grammar (one allowed decision branch -> compute_ff);
+        # empty when not actually a pre-schedulable decision or non-canonical.
+        return grammar.compute_prefill_ff_tokens() or None
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -1766,8 +1983,33 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
-            if scheduled_spec_token_ids and (
-                generated_token_ids or self.num_sampled_tokens_per_step == 0
+            if (
+                scheduled_spec_token_ids
+                and generated_token_ids
+                and request.jd_discard_pending == 0
+            ):
+                # Draft tokens accepted past the end-of-reasoning delimiter
+                # were sampled with the grammar bitmask suppressed and may
+                # violate the constraint. Truncate before the rejection
+                # accounting below so the tail is re-labelled as rejected
+                # drafts and re-decoded under the active mask.
+                keep = self.structured_output_manager.reasoning_boundary_keep_len(
+                    request, generated_token_ids
+                )
+                if keep < len(generated_token_ids):
+                    logger.info(
+                        "Truncating %d draft token(s) committed past the "
+                        "end-of-reasoning delimiter for request %s",
+                        len(generated_token_ids) - keep,
+                        req_id,
+                    )
+                    generated_token_ids = generated_token_ids[:keep]
+            if (
+                scheduled_spec_token_ids
+                and (generated_token_ids or self.num_sampled_tokens_per_step == 0)
+                # A step discarded at jump-forward emission settled its
+                # placeholder / num_computed accounting there.
+                and request.jd_discard_pending == 0
             ):
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_sampled = self.num_sampled_tokens_per_step
@@ -1829,13 +2071,25 @@ class Scheduler(SchedulerInterface):
                         request, new_token_ids
                     )
                 )
-                if advance_token_ids and not grammar.accept_tokens(
-                    req_id, advance_token_ids
+                # Stop tokens and the reasoning-end delimiter can still be
+                # committed alongside grammar content under spec decode; they are
+                # not part of the constrained language and llguidance cannot parse
+                # a special token (its 0xFF marker byte fails the content parse),
+                # so advancing over them would terminate a valid request.
+                # Tool-call / structural-tag specials are deliberately kept: a
+                # structural-tag grammar models them.
+                grammar_token_ids = (
+                    self.structured_output_manager.grammar_advance_token_ids(
+                        request, advance_token_ids
+                    )
+                )
+                if grammar_token_ids and not grammar.accept_tokens(
+                    req_id, grammar_token_ids
                 ):
                     logger.error(
                         "Unexpected: grammar rejected tokens %s for request %s. "
                         "Terminating request.",
-                        advance_token_ids,
+                        grammar_token_ids,
                         req_id,
                     )
                     request.status = RequestStatus.FINISHED_ERROR
@@ -1882,6 +2136,135 @@ class Scheduler(SchedulerInterface):
                         # Normal decode / re-prefill: token(s) at the END.
                         routed_experts = routing_data[end - len(new_token_ids) : end]
 
+            # Extract sample logprobs if needed.
+            if (
+                request.sampling_params is not None
+                and request.sampling_params.num_logprobs is not None
+                and logprobs
+            ):
+                new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
+
+            # Jump-forward: compute deterministic tokens forced by grammar.
+            if (
+                self.jump_decoding_enabled
+                and new_token_ids
+                and not stopped
+                and self.structured_output_manager.should_advance(request)
+                and _request_opts_into_jump_decoding(request)
+            ):
+                struct_output_request = request.structured_output_request
+                assert struct_output_request is not None
+                assert struct_output_request.grammar is not None
+                if not struct_output_request.grammar.is_terminated():
+                    ff_tokens = struct_output_request.grammar.advance_ff_tokens()
+
+                    if ff_tokens:
+                        # Append ff_tokens one by one, checking stop
+                        # conditions after each token (matching the
+                        # behavior in _update_request_with_output).
+                        for i, tok in enumerate(ff_tokens):
+                            request.append_output_token_ids(tok)
+                            new_token_ids.append(tok)
+                            stopped = check_stop(request, self.max_model_len)
+                            if stopped:
+                                ff_tokens = ff_tokens[: i + 1]
+                                break
+                        # jd_guaranteed_prefill verify: if the in-flight step was
+                        # pre-scheduled as [D, S_pred] and S_pred == S_actual (this
+                        # ff span), that step already prefilled the span correctly --
+                        # it IS the redo, done a step early -- so keep it (no discard)
+                        # and do not queue another redo. A stop truncates ff_tokens
+                        # above, so an over-prefilled S_pred then no longer matches
+                        # and we fall back. On any mismatch we take the validated
+                        # discard-and-redo below, discarding the wrong in-flight step.
+                        prefill_pred = request.pending_prefill_pred
+                        request.pending_prefill_pred = None
+                        if (
+                            envs.VLLM_JD_DEBUG_ASSERTS
+                            and prefill_pred is not None
+                            and not stopped
+                        ):
+                            # A [prefill] decision must be decision-independent: the
+                            # predicted span must equal the actual forced span.
+                            _assert_jd_prefill_match(request, prefill_pred, ff_tokens)
+                        guaranteed_hit = (
+                            prefill_pred is not None
+                            and not stopped
+                            and prefill_pred == ff_tokens
+                        )
+
+                        if not guaranteed_hit:
+                            self.pending_ff_tokens[req_id] = ff_tokens
+
+                            # Async: an in-flight step was forwarded before these
+                            # ff tokens existed, so its sample is conditioned on
+                            # the pre-jump context. Discard it and re-decode after
+                            # the ff tokens are committed. Release the placeholders
+                            # now so the next schedule() lays out positions without
+                            # the dead slots; the async scheduler drops the stale
+                            # sample on arrival.
+                            if not stopped and request.num_output_placeholders > 0:
+                                # Batch-queue depth 2: at most one step in
+                                # flight; its output arrives in one update.
+                                request.jd_discard_pending += 1
+                                if envs.VLLM_JD_DEBUG_ASSERTS:
+                                    _assert_jd_discard_depth(request)
+                                request.num_output_placeholders = 0
+                                # The in-flight step's chunk also covered K draft
+                                # positions where the ff tokens now belong, counted
+                                # as computed by schedule(). Mark them uncomputed so
+                                # the next schedule() re-runs the full ff span
+                                # through the target, and drop the dead spec
+                                # placeholders.
+                                request.num_computed_tokens = min(
+                                    request.num_computed_tokens,
+                                    request.num_tokens - len(ff_tokens),
+                                )
+                                request.spec_token_ids = []
+                        # guaranteed_hit: the [D, S_pred] chunk's KV (D + S) and its
+                        # post-span sample are correct, and num_computed_tokens /
+                        # num_output_placeholders already account for that chunk from
+                        # schedule time -- so leave them untouched and do not re-queue.
+
+                        # Extend logprobs for ff_tokens: each is
+                        # deterministic (logprob=0, all others=-inf),
+                        # mirroring what the model would produce if
+                        # the grammar bitmask allowed only one token.
+                        if new_logprobs is not None:
+                            n = len(ff_tokens)
+                            width = new_logprobs.logprob_token_ids.shape[1]
+                            # Columns 1.. use -1 as an invalid-token-id
+                            # sentinel so the downstream dict[token_id, ...]
+                            # build does not produce a spurious {0: -inf}
+                            # entry (or, worse, overwrite the column 0
+                            # logprob if the forced token itself is 0).
+                            ff_token_ids = np.full(
+                                (n, width),
+                                -1,
+                                dtype=new_logprobs.logprob_token_ids.dtype,
+                            )
+                            ff_token_ids[:, 0] = ff_tokens
+                            ff_logprobs = np.full(
+                                (n, width),
+                                -np.inf,
+                                dtype=new_logprobs.logprobs.dtype,
+                            )
+                            ff_logprobs[:, 0] = 0.0
+                            ff_ranks = np.zeros(
+                                n,
+                                dtype=new_logprobs.sampled_token_ranks.dtype,
+                            )
+                            new_logprobs = LogprobsLists(
+                                np.concatenate(
+                                    [new_logprobs.logprob_token_ids, ff_token_ids]
+                                ),
+                                np.concatenate([new_logprobs.logprobs, ff_logprobs]),
+                                np.concatenate(
+                                    [new_logprobs.sampled_token_ranks, ff_ranks]
+                                ),
+                                None,
+                            )
+
             should_emit_output = bool(
                 new_token_ids or pooler_output is not None or stopped
             )
@@ -1894,8 +2277,9 @@ class Scheduler(SchedulerInterface):
 
             finish_reason = None
             if stopped:
-                # Capture finish_reason BEFORE _handle_stopped_request, which may
-                # reset the status to WAITING for streaming requests that continue.
+                # Capture finish_reason BEFORE _handle_stopped_request, which
+                # may reset the status to WAITING for streaming requests that
+                # continue.
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 if finished:
@@ -1905,14 +2289,6 @@ class Scheduler(SchedulerInterface):
                     stopped_running_reqs.add(request)
                 else:
                     stopped_preempted_reqs.add(request)
-
-            # Extract sample logprobs if needed.
-            if (
-                request.sampling_params is not None
-                and request.sampling_params.num_logprobs is not None
-                and logprobs
-            ):
-                new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
@@ -2159,6 +2535,12 @@ class Scheduler(SchedulerInterface):
                     request.spec_token_ids = []
                 continue
 
+            if not _request_opts_into_spec_decode(request):
+                # Per-request opt-out: drop proposer-produced drafts.
+                if request.spec_token_ids:
+                    request.spec_token_ids = []
+                continue
+
             # Add newly generated spec token ids to the request.
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
@@ -2185,6 +2567,21 @@ class Scheduler(SchedulerInterface):
                 continue
 
             orig_num_spec_tokens = len(placeholder_spec_tokens)
+
+            # Per-request opt-out for speculative decoding. The async
+            # scheduling path routes drafts through this function instead
+            # of update_draft_token_ids, so the gate has to be mirrored
+            # here. Invalidate the scheduled drafts in scheduler_output
+            # directly (the local draft_token_ids list is not read
+            # downstream) by writing -1 sentinels into sched_spec_tokens
+            # and recording them as invalid. The verifier rejects -1 slots
+            # and the request falls back to single-token decode for this
+            # step.
+            if not _request_opts_into_spec_decode(request):
+                sched_spec_tokens[req_id] = [-1] * orig_num_spec_tokens
+                num_invalid_spec_tokens[req_id] = orig_num_spec_tokens
+                continue
+
             # Trim drafts to scheduled number of spec tokens
             # (needed for chunked prefill case for example).
             del spec_token_ids[orig_num_spec_tokens:]

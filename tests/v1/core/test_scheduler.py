@@ -4,6 +4,7 @@ import dataclasses
 from concurrent.futures import Future
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 
@@ -38,7 +39,12 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
 )
-from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import (
+    DraftTokenIds,
+    KVConnectorOutput,
+    LogprobsLists,
+    ModelRunnerOutput,
+)
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 
@@ -5730,3 +5736,590 @@ def test_hybrid_per_group_hit_divergence_fa_deeper_no_external():
     num_scheduled = output.num_scheduled_tokens[replay.request_id]
     # Must resume at the convergent boundary (block 0), not the deep FA hit.
     assert replay.num_tokens - num_scheduled == block_size
+
+
+def test_spec_drafts_dropped_when_request_opts_out():
+    """Proposer-produced drafts are discarded for requests that did not
+    opt into speculative decoding."""
+    scheduler = create_scheduler()
+    requests = create_requests(num_requests=1, max_tokens=20)
+    req = requests[0]
+    req.num_computed_tokens = req.num_tokens
+    req.status = RequestStatus.RUNNING
+    scheduler.requests[req.request_id] = req
+    scheduler.running.append(req)
+    # No opt-in (default None).
+    req.sampling_params.enable_speculative_decoding = None
+
+    scheduler.update_draft_token_ids(
+        DraftTokenIds(req_ids=[req.request_id], draft_token_ids=[[100, 101]])
+    )
+
+    assert req.spec_token_ids == []
+
+
+def test_spec_drafts_dropped_when_request_opts_out_async_path():
+    """Async-scheduling counterpart: drafts in
+    scheduler_output.scheduled_spec_decode_tokens are overwritten with -1
+    sentinels (and counted as invalid) when the request did not opt into
+    speculative decoding. This exercises update_draft_token_ids_in_output,
+    the entry point used by step_with_batch_queue."""
+    scheduler = create_scheduler()
+    requests = create_requests(num_requests=1, max_tokens=20)
+    req = requests[0]
+    req.num_computed_tokens = req.num_tokens
+    req.status = RequestStatus.RUNNING
+    scheduler.requests[req.request_id] = req
+    scheduler.running.append(req)
+    # No opt-in (default None).
+    req.sampling_params.enable_speculative_decoding = None
+
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={req.request_id: 1},
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={req.request_id: [100, 101, 102]},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+
+    scheduler.update_draft_token_ids_in_output(
+        DraftTokenIds(req_ids=[req.request_id], draft_token_ids=[[100, 101, 102]]),
+        scheduler_output,
+    )
+
+    assert scheduler_output.scheduled_spec_decode_tokens[req.request_id] == [
+        -1,
+        -1,
+        -1,
+    ]
+    assert scheduler_output.num_invalid_spec_tokens is not None
+    assert scheduler_output.num_invalid_spec_tokens[req.request_id] == 3
+
+
+def test_spec_drafts_kept_when_request_opts_in():
+    """Drafts are stored on the request when it explicitly opts in."""
+    scheduler = create_scheduler()
+    requests = create_requests(num_requests=1, max_tokens=20)
+    req = requests[0]
+    req.num_computed_tokens = req.num_tokens
+    req.status = RequestStatus.RUNNING
+    scheduler.requests[req.request_id] = req
+    scheduler.running.append(req)
+    req.sampling_params.enable_speculative_decoding = True
+
+    scheduler.update_draft_token_ids(
+        DraftTokenIds(req_ids=[req.request_id], draft_token_ids=[[100, 101]])
+    )
+
+    assert req.spec_token_ids == [100, 101]
+
+
+def test_spec_decoding_rejected_when_server_has_no_spec_config():
+    """Per-request enable_speculative_decoding=True against a server that
+    was not started with --speculative-config must raise — silently
+    accepting and ignoring it masks deployment-config errors."""
+    sp = SamplingParams(enable_speculative_decoding=True)
+    with pytest.raises(ValueError, match="no SpeculativeConfig"):
+        sp._validate_spec_decode(speculative_config=None)
+
+
+# ---------------------------------------------------------------------------
+# Jump-forward decoding tests
+# ---------------------------------------------------------------------------
+
+
+def _setup_jump_forward_request(scheduler, request, opt_in: bool = True):
+    """Put a request into RUNNING state with prefill done.
+
+    By default opts the request into jump decoding by setting
+    ``sampling_params.structured_outputs.enable_jump_decoding = True``.
+    Set opt_in=False to exercise the per-request opt-out path.
+    """
+    request.num_computed_tokens = request.num_tokens
+    request.status = RequestStatus.RUNNING
+    scheduler.requests[request.request_id] = request
+    scheduler.running.append(request)
+    request.sampling_params.structured_outputs = Mock(enable_jump_decoding=opt_in)
+
+
+def _make_mock_grammar(ff_tokens: list[int]):
+    grammar = Mock(spec=StructuredOutputGrammar)
+    grammar.accept_tokens = Mock(return_value=True)
+    grammar.is_terminated = Mock(return_value=False)
+    grammar.advance_ff_tokens = Mock(return_value=ff_tokens)
+    return grammar
+
+
+def _make_structured_output_request(grammar):
+    sor = Mock()
+    sor.grammar = grammar
+    sor.reasoning_ended = None
+    sor.reasoning_end_token_index = None
+    return sor
+
+
+def _empty_scheduler_output(req_id, num_tokens=1):
+    return SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={req_id: num_tokens},
+        total_num_scheduled_tokens=num_tokens,
+        scheduled_encoder_inputs={},
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+
+
+def test_jump_forward_tokens_injected():
+    """ff_tokens from grammar are appended to the request and stored in
+    pending_ff_tokens."""
+    scheduler = create_scheduler(enable_jump_decoding=True)
+    scheduler.structured_output_manager.should_advance = Mock(return_value=True)
+
+    requests = create_requests(num_requests=1, max_tokens=20)
+    req = requests[0]
+    _setup_jump_forward_request(scheduler, req)
+
+    grammar = _make_mock_grammar([100, 101, 102])
+    req.structured_output_request = _make_structured_output_request(grammar)
+
+    scheduler_output = _empty_scheduler_output(req.request_id)
+    model_output = ModelRunnerOutput(
+        req_ids=[req.request_id],
+        req_id_to_index={req.request_id: 0},
+        sampled_token_ids=[[7]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    scheduler.update_from_output(scheduler_output, model_output)
+
+    # Sampled token (7) followed by all three ff_tokens.
+    assert list(req.output_token_ids) == [7, 100, 101, 102]
+    assert scheduler.pending_ff_tokens[req.request_id] == [100, 101, 102]
+    assert not req.is_finished()
+
+
+def test_jump_forward_tokens_stop_eos():
+    """ff_tokens containing EOS truncate the sequence and stop the request."""
+    scheduler = create_scheduler(enable_jump_decoding=True)
+    scheduler.structured_output_manager.should_advance = Mock(return_value=True)
+
+    requests = create_requests(num_requests=1, max_tokens=20)
+    req = requests[0]
+    _setup_jump_forward_request(scheduler, req)
+
+    grammar = _make_mock_grammar([100, EOS_TOKEN_ID, 102])
+    req.structured_output_request = _make_structured_output_request(grammar)
+
+    scheduler_output = _empty_scheduler_output(req.request_id)
+    model_output = ModelRunnerOutput(
+        req_ids=[req.request_id],
+        req_id_to_index={req.request_id: 0},
+        sampled_token_ids=[[7]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    scheduler.update_from_output(scheduler_output, model_output)
+
+    assert list(req.output_token_ids) == [7, 100, EOS_TOKEN_ID]
+    assert req.status == RequestStatus.FINISHED_STOPPED
+    assert scheduler.pending_ff_tokens[req.request_id] == [100, EOS_TOKEN_ID]
+    # Stop cleanup must run for FF-triggered stops: request is gone from
+    # the running queue and finished_req_ids tracks it.
+    assert req not in scheduler.running
+    assert req.request_id in scheduler.finished_req_ids
+
+
+def test_jump_forward_tokens_stop_max_tokens():
+    """ff_tokens exceeding max_tokens truncate the sequence and stop the
+    request with FINISHED_LENGTH_CAPPED."""
+    scheduler = create_scheduler(enable_jump_decoding=True)
+    scheduler.structured_output_manager.should_advance = Mock(return_value=True)
+
+    # max_tokens=3 so after the sampled token (1), only 2 ff tokens fit.
+    requests = create_requests(num_requests=1, max_tokens=3)
+    req = requests[0]
+    _setup_jump_forward_request(scheduler, req)
+
+    grammar = _make_mock_grammar([100, 101, 102, 103])
+    req.structured_output_request = _make_structured_output_request(grammar)
+
+    scheduler_output = _empty_scheduler_output(req.request_id)
+    model_output = ModelRunnerOutput(
+        req_ids=[req.request_id],
+        req_id_to_index={req.request_id: 0},
+        sampled_token_ids=[[7]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    scheduler.update_from_output(scheduler_output, model_output)
+
+    assert list(req.output_token_ids) == [7, 100, 101]
+    assert req.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert req not in scheduler.running
+    assert req.request_id in scheduler.finished_req_ids
+
+
+def test_jump_forward_tokens_retain_unscheduled():
+    """pending_ff_tokens for a request not scheduled in the current step
+    must be preserved across steps."""
+    scheduler = create_scheduler(enable_jump_decoding=True)
+    scheduler.structured_output_manager.should_advance = Mock(return_value=True)
+
+    requests = create_requests(num_requests=1, max_tokens=20)
+    req = requests[0]
+    _setup_jump_forward_request(scheduler, req)
+    # should_advance is mocked True, so the request must carry a structured-output
+    # request (an empty ff grammar keeps the focus on `other`'s retention below).
+    req.structured_output_request = _make_structured_output_request(
+        _make_mock_grammar([])
+    )
+    scheduler.pending_ff_tokens[req.request_id] = [42, 43]
+
+    # Schedule a different request id so this one is not scheduled.
+    other = "other-req"
+    scheduler.pending_ff_tokens[other] = [99]
+
+    scheduler_output = _empty_scheduler_output(req.request_id)
+    # Step the scheduler so it builds outputs; we only care that the
+    # `other` request's tokens are retained for a later step.
+    # Simulate the schedule() path by directly checking _filter logic via
+    # internal API would be too invasive — assert state after a call.
+    # Use a no-op model output for the scheduled request.
+    model_output = ModelRunnerOutput(
+        req_ids=[req.request_id],
+        req_id_to_index={req.request_id: 0},
+        sampled_token_ids=[[7]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    # `update_from_output` doesn't touch pending_ff_tokens for `other`.
+    scheduler.update_from_output(scheduler_output, model_output)
+
+    assert scheduler.pending_ff_tokens.get(other) == [99]
+
+
+def test_jump_forward_tokens_logprobs():
+    """When logprobs are requested, ff_tokens get synthetic logprob entries
+    (logprob=0.0 for the deterministic token, -inf for the rest)."""
+    scheduler = create_scheduler(enable_jump_decoding=True)
+    scheduler.structured_output_manager.should_advance = Mock(return_value=True)
+
+    requests = create_requests(num_requests=1, max_tokens=20)
+    req = requests[0]
+    _setup_jump_forward_request(scheduler, req)
+    req.sampling_params.logprobs = 3
+
+    grammar = _make_mock_grammar([100, 101, 102])
+    req.structured_output_request = _make_structured_output_request(grammar)
+
+    scheduler_output = _empty_scheduler_output(req.request_id)
+
+    sampled_token_ids = np.array([[7, 10, 11, 12]], dtype=np.int32)
+    sampled_logprobs = np.array([[-0.5, -1.0, -2.0, -3.0]], dtype=np.float32)
+    sampled_ranks = np.array([1], dtype=np.int32)
+    logprobs = LogprobsLists(sampled_token_ids, sampled_logprobs, sampled_ranks, None)
+
+    model_output = ModelRunnerOutput(
+        req_ids=[req.request_id],
+        req_id_to_index={req.request_id: 0},
+        sampled_token_ids=[[7]],
+        logprobs=logprobs,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    engine_outputs = scheduler.update_from_output(scheduler_output, model_output)
+
+    output = engine_outputs[req.client_index].outputs[0]
+    assert output.new_token_ids == [7, 100, 101, 102]
+
+    lp = output.new_logprobs
+    assert lp is not None
+    assert lp.logprob_token_ids.shape[0] == 4
+    assert lp.logprobs.shape[0] == 4
+    assert lp.sampled_token_ranks.shape[0] == 4
+
+    # First row: original sampled logprobs.
+    assert lp.logprob_token_ids[0, 0] == 7
+    np.testing.assert_allclose(lp.logprobs[0, 0], -0.5)
+
+    # ff_token rows: column 0 holds the deterministic token with logprob 0.0.
+    # Columns 1+ have -inf (no real alternative) and -1 as the invalid
+    # token-id sentinel — guarantees no spurious {0: -inf} downstream.
+    for i, tok in enumerate([100, 101, 102], start=1):
+        assert lp.logprob_token_ids[i, 0] == tok
+        assert lp.logprobs[i, 0] == 0.0
+        assert np.all(np.isneginf(lp.logprobs[i, 1:]))
+        assert np.all(lp.logprob_token_ids[i, 1:] == -1)
+
+
+def test_jump_decoding_rejected_when_server_jd_disabled():
+    """Per-request enable_jump_decoding=True against a server that does NOT
+    have enable_jump_decoding in its --structured-outputs-config must raise.
+    Silently accepting and ignoring the flag would mask deployment-config
+    errors as performance regressions."""
+    from vllm.config.structured_outputs import StructuredOutputsConfig
+    from vllm.sampling_params import StructuredOutputsParams
+
+    sp = SamplingParams(
+        structured_outputs=StructuredOutputsParams(
+            json="{}", enable_jump_decoding=True
+        ),
+    )
+    # Case 1: server has structured_outputs configured but JD off.
+    so_config_off = StructuredOutputsConfig(
+        backend="guidance", enable_jump_decoding=False
+    )
+    with pytest.raises(ValueError, match="enable_jump_decoding"):
+        sp._validate_structured_outputs(
+            model_config=None, structured_outputs_config=so_config_off, tokenizer=None
+        )
+    # Case 2: server has no structured_outputs config at all.
+    with pytest.raises(ValueError, match="enable_jump_decoding"):
+        sp._validate_structured_outputs(
+            model_config=None, structured_outputs_config=None, tokenizer=None
+        )
+
+
+def test_jump_forward_skipped_when_request_opts_out():
+    """Server enables JD but request does not opt in — no FF tokens."""
+    scheduler = create_scheduler(enable_jump_decoding=True)
+    scheduler.structured_output_manager.should_advance = Mock(return_value=True)
+
+    requests = create_requests(num_requests=1, max_tokens=20)
+    req = requests[0]
+    _setup_jump_forward_request(scheduler, req, opt_in=False)
+
+    grammar = _make_mock_grammar([100, 101, 102])
+    req.structured_output_request = _make_structured_output_request(grammar)
+
+    scheduler_output = _empty_scheduler_output(req.request_id)
+    model_output = ModelRunnerOutput(
+        req_ids=[req.request_id],
+        req_id_to_index={req.request_id: 0},
+        sampled_token_ids=[[7]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    scheduler.update_from_output(scheduler_output, model_output)
+
+    # Only the sampled token; the grammar's ff_tokens were not consumed.
+    assert list(req.output_token_ids) == [7]
+    assert req.request_id not in scheduler.pending_ff_tokens
+    grammar.advance_ff_tokens.assert_not_called()
+
+
+def test_jd_spec_disjoint_invariant():
+    """A request must not carry both fast-forward tokens and speculative
+    drafts in one step (their buffer writes target the same rows)."""
+    from vllm.v1.core.sched.scheduler import _assert_jd_spec_disjoint
+
+    # Disjoint across requests is fine.
+    _assert_jd_spec_disjoint(
+        jump_forward_tokens={"a": [1, 2]},
+        scheduled_spec_decode_tokens={"b": [3, 4]},
+    )
+    # Same request with ff but empty spec is fine.
+    _assert_jd_spec_disjoint(
+        jump_forward_tokens={"a": [1, 2]},
+        scheduled_spec_decode_tokens={"a": []},
+    )
+    # Same request with both ff and spec violates the invariant.
+    with pytest.raises(AssertionError):
+        _assert_jd_spec_disjoint(
+            jump_forward_tokens={"a": [1, 2]},
+            scheduled_spec_decode_tokens={"a": [3, 4]},
+        )
+
+
+def test_jd_cache_safe_invariant():
+    """The prefix-cache boundary must stay within a request's committed token
+    length; caching past it would hash a discarded/uncomputed JD span (whose KV is
+    recomputed on the redo step) into the prefix cache for stale reuse."""
+    from vllm.v1.core.sched.scheduler import _assert_jd_cache_safe
+
+    (req,) = create_requests(num_requests=1, num_tokens=8)
+    assert req.num_tokens == 8
+
+    # A boundary at or below the committed length is safe (0, mid, exactly the end).
+    _assert_jd_cache_safe(req, 0)
+    _assert_jd_cache_safe(req, 5)
+    _assert_jd_cache_safe(req, 8)
+
+    # Committed outputs extend the safe boundary one-for-one.
+    req.append_output_token_ids([11, 12, 13])
+    assert req.num_tokens == 11
+    _assert_jd_cache_safe(req, 11)
+
+    # Caching past the committed length (the stale-KV bug a broken JD rollback or
+    # placeholder count would cause) must raise.
+    with pytest.raises(AssertionError):
+        _assert_jd_cache_safe(req, req.num_tokens + 1)
+    # A negative boundary (placeholders exceeding computed tokens) must raise.
+    with pytest.raises(AssertionError):
+        _assert_jd_cache_safe(req, -1)
+
+
+def test_jd_discard_depth_invariant():
+    """A jump may stack at most one pending discard (batch_queue depth 2); a deeper
+    pipeline (queue depth > 2) would break the single-in-flight discard-redo."""
+    from vllm.v1.core.sched.scheduler import _assert_jd_discard_depth
+
+    (req,) = create_requests(num_requests=1, num_tokens=8)
+
+    req.jd_discard_pending = 0
+    _assert_jd_discard_depth(req)
+    req.jd_discard_pending = 1
+    _assert_jd_discard_depth(req)
+
+    # Two in-flight steps dropped against one jump must raise.
+    req.jd_discard_pending = 2
+    with pytest.raises(AssertionError):
+        _assert_jd_discard_depth(req)
+
+
+def test_jd_prefill_match_invariant():
+    """A [prefill] decision must be decision-independent: the predicted span must
+    equal the actual forced span; a mismatch is a grammar bug (caught in debug)."""
+    from vllm.v1.core.sched.scheduler import _assert_jd_prefill_match
+
+    (req,) = create_requests(num_requests=1, num_tokens=8)
+    _assert_jd_prefill_match(req, [100, 101], [100, 101])  # match: ok
+    with pytest.raises(AssertionError):
+        _assert_jd_prefill_match(req, [100, 101], [100, 102])  # decision-dependent
+    with pytest.raises(AssertionError):
+        _assert_jd_prefill_match(req, [100, 101], [100])  # different length
+
+
+def _make_prefill_grammar(span: list[int], is_prefill: bool = True):
+    """Mock grammar at a [prefill] decision whose decision-independent forced span
+    is ``span`` (what compute_prefill_ff_tokens returns)."""
+    grammar = Mock(spec=StructuredOutputGrammar)
+    grammar.is_terminated = Mock(return_value=False)
+    grammar.is_prefill_region = Mock(return_value=is_prefill)
+    grammar.compute_prefill_ff_tokens = Mock(return_value=span)
+    return grammar
+
+
+def _setup_prefill_predict_request(scheduler, request):
+    """A running request with an in-flight decision (placeholders>0), opted into JD,
+    positioned at a [prefill] decision -- the predict precondition."""
+    request.num_computed_tokens = request.num_tokens
+    request.status = RequestStatus.RUNNING
+    request.num_output_placeholders = 1
+    request.pending_prefill_pred = None
+    request.sampling_params.structured_outputs = Mock(enable_jump_decoding=True)
+    request.structured_output_request = _make_structured_output_request(
+        _make_prefill_grammar([100, 101])
+    )
+    scheduler.requests[request.request_id] = request
+    scheduler.running.append(request)
+
+
+def test_maybe_guaranteed_prefill_span_gated_off(monkeypatch):
+    """Off by default (env unset): no pre-schedule even at a [prefill] decision."""
+    monkeypatch.setenv("JD_GUARANTEED_PREFILL", "0")
+    scheduler = create_scheduler(async_scheduling=True, enable_jump_decoding=True)
+    scheduler.structured_output_manager.should_advance = Mock(return_value=True)
+    (req,) = create_requests(num_requests=1, max_tokens=20)
+    _setup_prefill_predict_request(scheduler, req)
+    assert scheduler._maybe_guaranteed_prefill_span(req) is None
+
+
+def test_maybe_guaranteed_prefill_span_detects_and_gates(monkeypatch):
+    """With the env on, the predict returns S_pred exactly when a request opted into
+    JD has an in-flight decision and its committed grammar is at a [prefill] region;
+    each missing precondition disables it."""
+    monkeypatch.setenv("JD_GUARANTEED_PREFILL", "1")
+    scheduler = create_scheduler(async_scheduling=True, enable_jump_decoding=True)
+    scheduler.structured_output_manager.should_advance = Mock(return_value=True)
+    (req,) = create_requests(num_requests=1, max_tokens=20)
+    _setup_prefill_predict_request(scheduler, req)
+
+    # All preconditions met -> the decision-independent span.
+    assert scheduler._maybe_guaranteed_prefill_span(req) == [100, 101]
+
+    # Not at a [prefill] decision -> None.
+    req.structured_output_request.grammar.is_prefill_region = Mock(return_value=False)
+    assert scheduler._maybe_guaranteed_prefill_span(req) is None
+    req.structured_output_request.grammar.is_prefill_region = Mock(return_value=True)
+
+    # No in-flight decision token D -> None.
+    req.num_output_placeholders = 0
+    assert scheduler._maybe_guaranteed_prefill_span(req) is None
+    req.num_output_placeholders = 1
+
+    # Already mid guaranteed-prefill -> don't stack another.
+    req.pending_prefill_pred = [100, 101]
+    assert scheduler._maybe_guaranteed_prefill_span(req) is None
+    req.pending_prefill_pred = None
+
+    # Not opted into jump decoding -> None.
+    req.sampling_params.structured_outputs = Mock(enable_jump_decoding=False)
+    assert scheduler._maybe_guaranteed_prefill_span(req) is None
+    req.sampling_params.structured_outputs = Mock(enable_jump_decoding=True)
+
+    # Empty forced span (not actually pre-schedulable) -> None.
+    req.structured_output_request.grammar.compute_prefill_ff_tokens = Mock(
+        return_value=[]
+    )
+    assert scheduler._maybe_guaranteed_prefill_span(req) is None
+
+
+def test_guaranteed_prefill_cache_boundary_excludes_inflight_span(monkeypatch):
+    """Regression (GPU-observed _assert_jd_cache_safe trip): during an in-flight
+    jd_guaranteed_prefill [D, S_pred] step, S's KV is computed (so it is counted in
+    num_computed_tokens) but S is not yet committed (num_tokens) -- it is appended
+    only later, at the S_pred == S_actual verify. The prefix-cache boundary must
+    exclude that in-flight span (len(pending_prefill_pred)), so a span a mismatch
+    would discard is never hashed into the prefix cache before the commit."""
+    monkeypatch.setenv("VLLM_JD_DEBUG_ASSERTS", "1")
+    scheduler = create_scheduler(async_scheduling=True, enable_jump_decoding=True)
+    (req,) = create_requests(num_requests=1, num_tokens=203, max_tokens=4096)
+    req.status = RequestStatus.RUNNING
+    req.discard_latest_async_tokens = False
+    # In-flight [D, S_pred]: num_computed_tokens includes D (1) + a 6-token forced
+    # span S. This update commits only the decision token D; S commits at the verify.
+    req.pending_prefill_pred = [1, 2, 3, 4, 5, 6]
+    req.num_computed_tokens = 211
+    req.num_output_placeholders = 2
+
+    captured: list[int] = []
+    scheduler.kv_cache_manager.cache_blocks = Mock(
+        side_effect=lambda r, n: captured.append(n)
+    )
+
+    # Commit D. Without the fix num_to_cache would be 211 - 1 = 210, past the
+    # committed length 204 -> _assert_jd_cache_safe raises. With the fix the 6
+    # uncommitted S tokens are excluded: 211 - 1 - 6 == 204 == num_tokens.
+    _, stopped = scheduler._update_request_with_output(req, [999])
+    assert not stopped
+    assert req.num_tokens == 204  # D committed; S not yet
+    assert captured == [204]
+
+    # After the verify commits S and clears pending_prefill_pred, the next step
+    # caches normally -- S's blocks are now in the committed range.
+    req.append_output_token_ids([1, 2, 3, 4, 5, 6])  # S committed at verify
+    req.pending_prefill_pred = None
+    req.num_output_placeholders = 1  # only the post-S sample is still in flight
+    assert req.num_tokens == 210
+    captured.clear()
+    scheduler._update_request_with_output(req, [777])  # post-S sample arrives
+    assert req.num_tokens == 211
+    assert captured == [211]  # 211 - 0 == 211 == num_tokens; S's blocks cached now

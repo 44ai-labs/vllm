@@ -3,10 +3,13 @@
 
 """Tests for Gemma4 chat template rendering."""
 
+import json
 from pathlib import Path
 
 import jinja2.sandbox
 import pytest
+
+from vllm.entrypoints.chat_utils import _postprocess_messages
 
 TEMPLATE_PATH = (
     Path(__file__).resolve().parent.parent.parent
@@ -412,3 +415,109 @@ class TestGemma4ChatTemplate:
         assert "<|image|>" in result
         assert "<|audio|>" in result
         assert "<|video|>" in result
+
+
+SCOPE = 'Mark prior studies as "Vorbefund".\n\nOtherwise write "Keine."'
+
+
+def _state_exchange():
+    """A tool call and its JSON result as an OpenAI client sends them."""
+    return [
+        {"role": "user", "content": "Shorten the scope."},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {
+                        "name": "GetTemplateState",
+                        "arguments": '{"template_id": "tpl-1"}',
+                    },
+                },
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "c1",
+            "content": json.dumps({"scope": {"description": SCOPE}, "version": 3}),
+        },
+    ]
+
+
+def _rendered_tool_responses(template, messages):
+    _postprocess_messages(messages)
+    result = _render(template, messages, add_generation_prompt=True)
+    return result, result[result.index("<|tool_response>") :]
+
+
+class TestDecodedToolResults:
+    """VLLM_DECODE_TOOL_RESULTS: results reach the model like tool-call arguments."""
+
+    def test_without_the_flag_the_result_shows_json_escapes(
+        self, gemma4_template, monkeypatch
+    ):
+        monkeypatch.delenv("VLLM_DECODE_TOOL_RESULTS", raising=False)
+
+        _, responses = _rendered_tool_responses(gemma4_template, _state_exchange())
+
+        assert responses.startswith("<|tool_response>response:GetTemplateState{value:")
+        assert '\\"Vorbefund\\".\\n\\nOtherwise' in responses
+
+    def test_with_the_flag_the_result_is_rendered_natively(
+        self, gemma4_template, monkeypatch
+    ):
+        monkeypatch.setenv("VLLM_DECODE_TOOL_RESULTS", "1")
+
+        result, responses = _rendered_tool_responses(gemma4_template, _state_exchange())
+
+        assert responses == (
+            "<|tool_response>response:GetTemplateState{scope:{description:"
+            '<|"|>' + SCOPE + '<|"|>},version:3}<tool_response|>'
+        )
+        # The model's own call is native too, so both directions now match.
+        assert 'call:GetTemplateState{template_id:<|"|>tpl-1<|"|>}' in result
+        assert result.count("<|tool_response>") == 1
+        assert not result.rstrip().endswith("<|turn>model")
+
+    def test_with_the_flag_parallel_results_render_in_order(
+        self, gemma4_template, monkeypatch
+    ):
+        monkeypatch.setenv("VLLM_DECODE_TOOL_RESULTS", "1")
+        messages = _state_exchange()
+        messages[1]["tool_calls"].append(
+            {
+                "id": "c2",
+                "type": "function",
+                "function": {"name": "ListTemplates", "arguments": "{}"},
+            }
+        )
+        messages.append(
+            {"role": "tool", "tool_call_id": "c2", "content": "Tool call failed: boom"}
+        )
+
+        _, responses = _rendered_tool_responses(gemma4_template, messages)
+
+        assert responses.count("<|tool_response>") == 2
+        assert responses.index("response:GetTemplateState{") < responses.index(
+            'response:ListTemplates{value:<|"|>Tool call failed: boom<|"|>}'
+        )
+
+    def test_with_the_flag_a_later_turn_still_follows_the_results(
+        self, gemma4_template, monkeypatch
+    ):
+        monkeypatch.setenv("VLLM_DECODE_TOOL_RESULTS", "1")
+        messages = [
+            *_state_exchange(),
+            {"role": "assistant", "content": "The scope has two paragraphs."},
+            {"role": "user", "content": "Thanks."},
+        ]
+
+        result, responses = _rendered_tool_responses(gemma4_template, messages)
+
+        assert result.count("<|tool_response>") == 1
+        assert responses.index("<tool_response|>") < responses.index(
+            "The scope has two paragraphs."
+        )
+        assert result.endswith("<|turn>model\n<|channel>thought\n<channel|>")

@@ -153,6 +153,11 @@ class ParserEngine(Parser):
         return self.parser_engine_config.terminals.get("THINK_START")
 
     @property
+    def reasoning_end_token_id(self) -> int | None:
+        """Single-token id of the reasoning-end delimiter, or None."""
+        return self._reasoning_end_token_id
+
+    @property
     def reasoning_end_str(self) -> str | None:
         return self.parser_engine_config.terminals.get("THINK_END")
 

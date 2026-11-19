@@ -646,11 +646,14 @@ class OpenAIServingChat(GenerateBaseServing):
                         logprobs = None
 
                     if delta_message is None:
-                        # NOTE: If return_token_ids is enabled, we still need to
-                        # send a chunk with token_ids even if delta_message is None
-                        # to ensure all tokens are included in the response
+                        # A chunk is still sent for an empty delta when token_ids or
+                        # token_texts are requested, so every token reaches the client.
                         if output.finish_reason is None and (
-                            not request.return_token_ids or hide_stream_metadata
+                            (
+                                not request.return_token_ids
+                                and not request.return_token_texts
+                            )
+                            or hide_stream_metadata
                         ):
                             continue
                         delta_message = DeltaMessage()
@@ -686,6 +689,9 @@ class OpenAIServingChat(GenerateBaseServing):
                     include_token_ids = (
                         request.return_token_ids and not hide_stream_metadata
                     )
+                    include_token_texts = (
+                        request.return_token_texts and not hide_stream_metadata
+                    )
 
                     if output.finish_reason is None:
                         # Send token-by-token response for each request.n
@@ -696,6 +702,9 @@ class OpenAIServingChat(GenerateBaseServing):
                             finish_reason=None,
                             token_ids=(
                                 as_list(output.token_ids) if include_token_ids else None
+                            ),
+                            token_texts=(
+                                output.token_texts if include_token_texts else None
                             ),
                         )
 
@@ -724,6 +733,9 @@ class OpenAIServingChat(GenerateBaseServing):
                             stop_reason=output.stop_reason,
                             token_ids=(
                                 as_list(output.token_ids) if include_token_ids else None
+                            ),
+                            token_texts=(
+                                output.token_texts if include_token_texts else None
                             ),
                         )
 
@@ -1027,6 +1039,11 @@ class OpenAIServingChat(GenerateBaseServing):
                 token_ids=(
                     as_list(output.token_ids)
                     if request.return_token_ids and not suppress_metadata
+                    else None
+                ),
+                token_texts=(
+                    output.token_texts
+                    if request.return_token_texts and not suppress_metadata
                     else None
                 ),
                 routed_experts=routed_experts_b64,

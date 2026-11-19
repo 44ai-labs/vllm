@@ -198,16 +198,11 @@ def build_logitsprocs(
         )
         return LogitsProcessors()
 
-    # Check if speculative decoding is enabled.
-    if vllm_config.speculative_config:
-        if custom_logitsprocs:
-            raise ValueError(STR_SPEC_DEC_REJECTS_LOGITSPROCS)
-        logger.warning(
-            "min_p and logit_bias parameters won't work with speculative decoding."
-        )
-        return LogitsProcessors(
-            [MinTokensLogitsProcessor(vllm_config, device, is_pin_memory)]
-        )
+    # The builtin processors all implement apply_with_spec_decode, so they
+    # stay active under speculative decoding; custom ones have no spec-decode
+    # hook and are rejected.
+    if vllm_config.speculative_config and custom_logitsprocs:
+        raise ValueError(STR_SPEC_DEC_REJECTS_LOGITSPROCS)
 
     custom_logitsprocs_classes = _load_custom_logitsprocs(custom_logitsprocs)
     return LogitsProcessors(

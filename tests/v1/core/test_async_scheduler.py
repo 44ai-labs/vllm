@@ -66,6 +66,42 @@ def test_stop_by_max_tokens(max_tokens: int):
     assert total_num_scheduled_tokens == expected_total_num_scheduled_tokens
 
 
+def test_async_per_request_spec_decode_opt_out():
+    """Per-request MTP opt-out must hold under async scheduling.
+
+    Regression for the async-scheduling gap: the sync gate lives in
+    ``update_draft_token_ids``, which the async path never calls.
+    ``AsyncScheduler._update_after_schedule`` must clear ``spec_token_ids`` for
+    opted-out requests so the next ``schedule()`` reserves no speculative slots for
+    them, while opted-in requests keep their placeholders.
+    """
+    scheduler = create_scheduler(
+        async_scheduling=True, num_speculative_tokens=3, speculative_method="ngram_gpu"
+    )
+
+    # Separate create_requests calls so each request owns its SamplingParams.
+    opted_in = create_requests(num_requests=1, max_tokens=10, req_ids=["in"])[0]
+    opted_out = create_requests(num_requests=1, max_tokens=10, req_ids=["out"])[0]
+    opted_in.sampling_params.enable_speculative_decoding = True
+    opted_out.sampling_params.enable_speculative_decoding = False
+    scheduler.add_request(opted_in)
+    scheduler.add_request(opted_out)
+
+    # Prefill (no spec scheduled yet), then the first decode step. The prefill step's
+    # _update_after_schedule sets spec_token_ids per opt-in; the next schedule() acts
+    # on it. Only the prefill output is fed back, so no spec-output mocking is needed.
+    sched0 = scheduler.schedule()
+    scheduler.update_from_output(sched0, _make_model_runner_output(sched0))
+    sched1 = scheduler.schedule()
+
+    # The opt-in gate is reflected directly in spec_token_ids ...
+    assert opted_in.spec_token_ids == [-1, -1, -1]
+    assert opted_out.spec_token_ids == []
+    # ... and in what the next step actually schedules.
+    assert len(sched1.scheduled_spec_decode_tokens.get("in", [])) == 3
+    assert len(sched1.scheduled_spec_decode_tokens.get("out", [])) == 0
+
+
 def test_abort():
     scheduler = create_scheduler(async_scheduling=True)
     requests = create_requests(num_requests=10, max_tokens=20)
@@ -711,3 +747,181 @@ def test_kv_pressure_preempt_mid_handoff(kv_role: str):
     else:
         assert handoff.is_finished()
         assert handoff.num_output_tokens == 1
+
+
+def _jd_model_output(req_id: str, token: int) -> ModelRunnerOutput:
+    return ModelRunnerOutput(
+        req_ids=[req_id],
+        req_id_to_index={req_id: 0},
+        sampled_token_ids=[[token]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+
+def test_async_jump_forward_discards_inflight_sample():
+    """Jump-forward under async scheduling must discard the in-flight sample.
+
+    When ff tokens are emitted, the next step is already in flight: its
+    forward predates the jump, so its sample is conditioned on a pre-jump
+    context while the deferred mask and the committed ordering are post-jump.
+    The scheduler must release the in-flight placeholders at emission time
+    (so the next schedule() lays out the ff positions without dead slots),
+    drop the in-flight sample when it arrives, and re-decode the position
+    after the ff tokens are processed.
+    """
+    scheduler = create_scheduler(async_scheduling=True, enable_jump_decoding=True)
+    scheduler.structured_output_manager.should_advance = Mock(return_value=True)
+
+    req = create_requests(num_requests=1, max_tokens=20)[0]
+    req.sampling_params.structured_outputs = Mock(enable_jump_decoding=True)
+    grammar = Mock(spec=StructuredOutputGrammar)
+    grammar.accept_tokens = Mock(return_value=True)
+    grammar.is_terminated = Mock(return_value=False)
+    grammar.advance_ff_tokens = Mock(return_value=[100, 101, 102])
+    req.structured_output_request = Mock(
+        grammar=grammar, reasoning_ended=None, reasoning_end_token_index=None
+    )
+    scheduler.add_request(req)
+
+    # Step N (prefill + first sample) and step N+1 are scheduled before
+    # step N's output is processed -- the async in-flight window.
+    sched_n = scheduler.schedule()
+    sched_n1 = scheduler.schedule()
+    assert req.num_output_placeholders == 2
+
+    # Step N's output commits token 7; the grammar then jumps 3 tokens.
+    # The in-flight step N+1 predates the jump: its placeholder must be
+    # released and its (future) sample marked for discard.
+    scheduler.update_from_output(sched_n, _jd_model_output(req.request_id, 7))
+    assert list(req.output_token_ids) == [7, 100, 101, 102]
+    assert scheduler.pending_ff_tokens[req.request_id] == [100, 101, 102]
+    assert req.jd_discard_pending == 1
+    assert req.num_output_placeholders == 0
+
+    # Step N+1's sample (9) arrives: dropped, not committed, and the
+    # grammar is never advanced over it.
+    scheduler.update_from_output(sched_n1, _jd_model_output(req.request_id, 9))
+    assert list(req.output_token_ids) == [7, 100, 101, 102]
+    assert req.jd_discard_pending == 0
+    grammar.accept_tokens.assert_called_once_with(req.request_id, [7])
+
+    # The next schedule() lays out EXACTLY the 3 ff tokens -- no dead slot
+    # for the discarded sample (the broken layout would schedule 4).
+    grammar.advance_ff_tokens = Mock(return_value=[])
+    sched_n2 = scheduler.schedule()
+    assert sched_n2.num_scheduled_tokens[req.request_id] == 3
+    assert sched_n2.jump_forward_tokens == {req.request_id: [100, 101, 102]}
+    # ... and reserves one fresh placeholder for the re-decoded position.
+    assert req.num_output_placeholders == 1
+
+
+def test_async_jump_forward_no_inflight_no_discard():
+    """With no step in flight at ff-emission time there is nothing to
+    discard: the placeholders the request accumulated are its own step's,
+    already consumed by the commit."""
+    scheduler = create_scheduler(async_scheduling=True, enable_jump_decoding=True)
+    scheduler.structured_output_manager.should_advance = Mock(return_value=True)
+
+    req = create_requests(num_requests=1, max_tokens=20)[0]
+    req.sampling_params.structured_outputs = Mock(enable_jump_decoding=True)
+    grammar = Mock(spec=StructuredOutputGrammar)
+    grammar.accept_tokens = Mock(return_value=True)
+    grammar.is_terminated = Mock(return_value=False)
+    grammar.advance_ff_tokens = Mock(return_value=[100])
+    req.structured_output_request = Mock(
+        grammar=grammar, reasoning_ended=None, reasoning_end_token_index=None
+    )
+    scheduler.add_request(req)
+
+    # Only step N scheduled: its own placeholder is consumed by the commit,
+    # leaving none in flight when the jump is emitted.
+    sched_n = scheduler.schedule()
+    assert req.num_output_placeholders == 1
+
+    scheduler.update_from_output(sched_n, _jd_model_output(req.request_id, 7))
+    assert list(req.output_token_ids) == [7, 100]
+    assert req.jd_discard_pending == 0
+    assert req.num_output_placeholders == 0
+
+
+def test_async_jump_forward_discard_rolls_back_dead_spec_positions():
+    """With MTP, the in-flight step's chunk also covers K draft positions --
+    exactly where the ff tokens get committed. The discard must mark those
+    positions uncomputed (their KV belongs to dead drafts) and drop the dead
+    spec placeholders, so the next schedule() re-runs the FULL ff span
+    through the target instead of just its tail."""
+    scheduler = create_scheduler(async_scheduling=True, enable_jump_decoding=True)
+    scheduler.structured_output_manager.should_advance = Mock(return_value=True)
+
+    req = create_requests(num_requests=1, max_tokens=20)[0]
+    req.sampling_params.structured_outputs = Mock(enable_jump_decoding=True)
+    grammar = Mock(spec=StructuredOutputGrammar)
+    grammar.accept_tokens = Mock(return_value=True)
+    grammar.is_terminated = Mock(return_value=False)
+    grammar.advance_ff_tokens = Mock(return_value=[100, 101, 102])
+    req.structured_output_request = Mock(
+        grammar=grammar, reasoning_ended=None, reasoning_end_token_index=None
+    )
+    scheduler.add_request(req)
+
+    sched_n = scheduler.schedule()
+    # Simulate the MTP in-flight step: 1 sample + 4 draft lanes scheduled,
+    # with the draft positions already counted as computed.
+    req.spec_token_ids = [-1, -1, -1, -1]
+    req.num_output_placeholders += 1 + 4
+    req.num_computed_tokens += 1 + 4
+
+    scheduler.update_from_output(sched_n, _jd_model_output(req.request_id, 7))
+    assert list(req.output_token_ids) == [7, 100, 101, 102]
+    assert req.jd_discard_pending == 1
+    assert req.num_output_placeholders == 0
+    assert req.spec_token_ids == []
+    # All 3 ff positions are uncomputed again: the dead draft KV there must
+    # be overwritten by the real tokens.
+    assert req.num_computed_tokens == req.num_tokens - 3
+
+    grammar.advance_ff_tokens = Mock(return_value=[])
+    sched_n1 = scheduler.schedule()
+    assert sched_n1.num_scheduled_tokens[req.request_id] == 3
+    assert sched_n1.jump_forward_tokens == {req.request_id: [100, 101, 102]}
+
+
+def test_async_jd_discard_skips_spec_rejection_accounting():
+    """The discarded step's spec-rejection accounting must not run: its
+    placeholders and num_computed were already settled at ff-emission time,
+    and a second num_computed subtraction would desync the position math."""
+    scheduler = create_scheduler(async_scheduling=True, enable_jump_decoding=True)
+    scheduler.structured_output_manager.should_advance = Mock(return_value=True)
+
+    req = create_requests(num_requests=1, max_tokens=20)[0]
+    req.sampling_params.structured_outputs = Mock(enable_jump_decoding=True)
+    req.structured_output_request = Mock(
+        grammar=Mock(spec=StructuredOutputGrammar),
+        reasoning_ended=None,
+        reasoning_end_token_index=None,
+    )
+    scheduler.add_request(req)
+    scheduler.schedule()
+
+    req.jd_discard_pending = 1
+    nc_before = req.num_computed_tokens
+    dead = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={req.request_id: 5},
+        total_num_scheduled_tokens=5,
+        scheduled_encoder_inputs={},
+        scheduled_spec_decode_tokens={req.request_id: [-1, -1, -1, -1]},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+    scheduler.update_from_output(dead, _jd_model_output(req.request_id, 9))
+    # 1 sampled token of 4 drafts would normally subtract 3 rejected from
+    # num_computed -- must NOT happen for a discarded step; the sample
+    # itself is dropped without being committed.
+    assert req.num_computed_tokens == nc_before
+    assert req.jd_discard_pending == 0
+    assert list(req.output_token_ids) == []
