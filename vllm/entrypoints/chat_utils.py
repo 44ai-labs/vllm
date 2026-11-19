@@ -1949,43 +1949,27 @@ def _decoded_tool_result(content: str) -> Any:
 def _attach_tool_responses(messages: list[ConversationMessage]) -> None:
     """Attach the tool results that follow each call, decoded, as ``tool_responses``.
 
-    Parsing JSON tool responses are naturally escaped
-    Templates that render structured values natively (Gemma 4) then show results
-    without JSON escapes, like the tool-call arguments. The ``role: tool`` messages
-    stay for templates that read them.
+    A JSON result sent as text reaches the prompt with its escapes and the model
+    copies them. Templates that render structured values natively (Gemma 4) show
+    a decoded result without them, like the tool-call arguments. The
+    ``role: tool`` messages stay for templates that read them.
     """
     for index, message in enumerate(messages):
         if message["role"] != "assistant" or not message.get("tool_calls"):
             continue
-        # get all tool messages following the assistant message with tool calls
-        # {
-        #       "role": "assistant",
-        #       "tool_calls": [
-        #         {
-        #           "id": "call_1",
-        #           "type": "function",
-        #           "function": {
-        #             "name": "GetExample",
-        #             "arguments": "{\"ab\": \"xyz\"}"
-        #           }
-        #         }
-        #       ]
-        #     },
-        #     {
-        #       "role": "tool",
-        #       "tool_call_id": "call_1",
-        #       "content": "{\"source\": \"....
         results = list(
             takewhile(lambda follow: follow["role"] == "tool", messages[index + 1 :])
         )
-        # A result with an image or other non-text part is handled over the template's path
+        # A result with an image or other non-text part stays on the template's
+        # own path, which places the media tokens.
         if not results or not all(isinstance(r.get("content"), str) for r in results):
             continue
         names = {
             call.get("id"): call["function"]["name"] for call in message["tool_calls"]
         }
-        # Some model templates can't handle a dict in content (e.g. Gemma 4), so we write it into tool_responses,
-        # this is Gemma's native format - if tool_responses is present then Gemma will read it and ignore tool_calls
+        # The Gemma 4 template cannot render a dict as a tool message's content.
+        # `tool_responses` is its native field: when present, the template renders
+        # it and skips the `role: tool` messages that follow.
         message["tool_responses"] = [
             {
                 "name": names.get(result.get("tool_call_id"))
